@@ -1,0 +1,271 @@
+package com.atsuishio.superbwarfare.entity.vehicle.base
+
+import com.atsuishio.superbwarfare.entity.getValue
+import com.atsuishio.superbwarfare.entity.setValue
+import com.atsuishio.superbwarfare.entity.vehicle.utils.VehicleVecUtils.getXRotFromVector
+import com.atsuishio.superbwarfare.item.IVehicleInteract
+import com.atsuishio.superbwarfare.item.misc.firingParameters
+import com.atsuishio.superbwarfare.tools.FormatTool.format0D
+import com.atsuishio.superbwarfare.tools.ParticleTool
+import com.atsuishio.superbwarfare.tools.TrajectoryCalculator.calculateLaunchVector
+import com.atsuishio.superbwarfare.tools.randomPos
+import net.minecraft.ChatFormatting
+import net.minecraft.core.BlockPos
+import net.minecraft.nbt.CompoundTag
+import net.minecraft.network.chat.Component
+import net.minecraft.network.syncher.EntityDataAccessor
+import net.minecraft.network.syncher.EntityDataSerializers
+import net.minecraft.network.syncher.SynchedEntityData
+import net.minecraft.server.level.ServerLevel
+import net.minecraft.world.InteractionHand
+import net.minecraft.world.InteractionResult
+import net.minecraft.world.entity.Entity
+import net.minecraft.world.entity.EntityType
+import net.minecraft.world.entity.LivingEntity
+import net.minecraft.world.entity.player.Player
+import net.minecraft.world.item.ItemStack
+import net.minecraft.world.level.Level
+import net.minecraft.world.phys.Vec3
+import org.joml.Vector3f
+import java.util.*
+
+open class ArtilleryEntity(type: EntityType<*>, world: Level) : VehicleEntity(type, world) {
+
+    open var shootVec by SHOOT_VEC
+    open var depressed by DEPRESSED
+    open var targetPos by TARGET_POS
+    open var originPos by ORIGIN_POS
+    open var radius by RADIUS
+    open var lockTurret by LOCK_TURRET
+
+    override fun interact(player: Player, hand: InteractionHand): InteractionResult {
+        if (getGunData("Main") == null) return InteractionResult.SUCCESS
+
+        val offStack = player.offhandItem
+        val offItem = offStack.item
+        if (offItem is IVehicleInteract) {
+            val res = offItem.onInteractVehicle(this, offStack, player, hand)
+            if (res != null) return res
+        }
+
+        return super.interact(player, hand)
+    }
+
+    override fun onCrowbarInteract(
+        stack: ItemStack,
+        player: Player,
+        hand: InteractionHand
+    ): InteractionResult? {
+        val res = super.onCrowbarInteract(stack, player, hand)
+        val gunData = getGunData("Main") ?: return res
+        if (!player.isShiftKeyDown && !isWreck) {
+            if (gunData.ammo.get() > 0 && player.level() is ServerLevel) {
+                vehicleShoot(player, "Main", targetPos.center)
+            }
+            return InteractionResult.SUCCESS
+        }
+        return res
+    }
+
+    override fun onAddedToWorld() {
+        super.onAddedToWorld()
+        shootVec = forward.toVector3f()
+    }
+
+    override fun defineSynchedData() {
+        super.defineSynchedData()
+
+        with(entityData) {
+            define(SHOOT_VEC, forward.toVector3f())
+            define(DEPRESSED, false)
+            define(TARGET_POS, BlockPos(0, 0, 0))
+            define(ORIGIN_POS, BlockPos(0, 0, 0))
+            define(RADIUS, 0)
+            define(LOCK_TURRET, true)
+        }
+    }
+
+    override fun addAdditionalSaveData(compound: CompoundTag) {
+        super.addAdditionalSaveData(compound)
+        compound.putFloat("ShootVecX", shootVec.x)
+        compound.putFloat("ShootVecY", shootVec.y)
+        compound.putFloat("ShootVecZ", shootVec.z)
+
+        compound.putBoolean("Depressed", depressed)
+        compound.putInt("Radius", radius)
+        compound.putInt("TargetX", targetPos.x)
+        compound.putInt("TargetY", targetPos.y)
+        compound.putInt("TargetZ", targetPos.z)
+        compound.putInt("OriginX", originPos.x)
+        compound.putInt("OriginY", originPos.y)
+        compound.putInt("OriginZ", originPos.z)
+    }
+
+    override fun readAdditionalSaveData(compound: CompoundTag) {
+        super.readAdditionalSaveData(compound)
+        if (compound.contains("ShootVecX") && compound.contains("ShootVecY") && compound.contains("ShootVecZ")) {
+            shootVec =
+                Vector3f(compound.getFloat("ShootVecX"), compound.getFloat("ShootVecY"), compound.getFloat("ShootVecZ"))
+        }
+        if (compound.contains("Depressed")) {
+            depressed = compound.getBoolean("Depressed")
+        }
+        if (compound.contains("Radius")) {
+            radius = compound.getInt("Radius")
+        }
+        if (compound.contains("TargetX") && compound.contains("TargetY") && compound.contains("TargetZ")) {
+            targetPos = BlockPos(compound.getInt("TargetX"), compound.getInt("TargetX"), compound.getInt("TargetZ"))
+        }
+        if (compound.contains("OriginX") && compound.contains("OriginY") && compound.contains("OriginZ")) {
+            originPos = BlockPos(compound.getInt("OriginX"), compound.getInt("OriginX"), compound.getInt("OriginZ"))
+        }
+    }
+
+    open fun setTarget(stack: ItemStack, entity: Entity?, weaponName: String) {
+        if (this.isWreck) return
+        val parameters = stack.firingParameters
+        var canAim = true
+
+        targetPos = parameters.pos
+        depressed = !parameters.isDepressed
+        radius = parameters.radius
+        val distance = targetPos.center.distanceTo(getShootPos(weaponName, 1f))
+        val randomPos = targetPos.center.randomPos(radius).add(0.0, -0.5 - 0.0015 * distance, 0.0)
+        val launchVector = calculateLaunchVector(
+            getShootPos(weaponName, 1f),
+            randomPos,
+            getProjectileVelocity(weaponName).toDouble(),
+            getProjectileGravity(weaponName).toDouble(),
+            depressed
+        )
+        val launchVector2 = calculateLaunchVector(
+            getShootPos(weaponName, 1f),
+            randomPos,
+            getProjectileVelocity(weaponName).toDouble(),
+            getProjectileGravity(weaponName).toDouble(),
+            !depressed
+        )
+
+        var component = Component.literal("")
+        val location = Component.translatable(
+            "tips.superbwarfare.mortar.position",
+            this.displayName,
+            "[${format0D(x)}, ${format0D(y)}, ${format0D(z)}]"
+        )
+
+        if (launchVector == null) {
+            canAim = false
+            component = Component.translatable("tips.superbwarfare.mortar.out_of_range")
+        } else {
+            val angle = -getXRotFromVector(launchVector).toFloat()
+            val angle2 = -launchVector2?.let { getXRotFromVector(it).toFloat() }!!
+            if (angle < -turretMaxPitch || angle > -turretMinPitch) {
+                if (angle2 > -turretMaxPitch && angle2 < -turretMinPitch) {
+                    component = Component.translatable("tips.superbwarfare.ballistics.warn2")
+                    canAim = false
+                } else {
+                    if (entity is Player) {
+                        entity.displayClientMessage(
+                            location.copy().append(component).withStyle(ChatFormatting.RED),
+                            false
+                        )
+                    }
+                    return
+                }
+            }
+
+            if (angle < -turretMaxPitch) {
+                component = Component.translatable("tips.superbwarfare.ballistics.warn")
+                canAim = false
+            }
+        }
+
+        if (canAim) {
+            lockTurret = false
+            launchVector?.toVector3f()?.let { shootVec = it }
+        } else if (entity is Player) {
+            entity.displayClientMessage(location.copy().append(component).withStyle(ChatFormatting.RED), false)
+        }
+    }
+
+    open fun resetTarget(weaponName: String) {
+        if (this.isWreck) return
+        val distance = targetPos.center.distanceTo(getShootPos(weaponName, 1f))
+        val randomPos = targetPos.center.randomPos(radius).add(0.0, -0.5 - 0.0015 * distance, 0.0)
+        val launchVector = calculateLaunchVector(
+            getShootPos(weaponName, 1f),
+            randomPos,
+            getProjectileVelocity(weaponName).toDouble(),
+            getProjectileGravity(weaponName).toDouble(),
+            depressed
+        ) ?: return
+
+        val angle = -getXRotFromVector(launchVector).toFloat()
+        if (angle > -turretMaxPitch && angle < -turretMinPitch) {
+            shootVec = launchVector.toVector3f()
+        }
+    }
+
+
+    override fun baseTick() {
+        super.baseTick()
+        if (this.isWreck) return
+
+        val controller = getNthEntity(turretControllerIndex)
+
+        if (deltaMovement.horizontalDistanceSqr() > 0.007 && this !is SpArtilleryEntity) {
+            lockTurret = true
+        }
+
+        if (controller != null) {
+            shootVec = controller.getViewVector(1f).toVector3f()
+        } else if (!lockTurret) {
+            turretAutoAimFromVector(Vec3(shootVec))
+        }
+    }
+
+    override fun vehicleShoot(living: LivingEntity?, weaponName: String, targetPos: Vec3?) {
+        beforeShoot(living, weaponName)
+        super.vehicleShoot(living, weaponName, targetPos)
+    }
+
+    override fun vehicleShoot(living: LivingEntity?, uuid: UUID?, targetPos: Vec3?) {
+        beforeShoot(living, getGunName(getSeatIndex(living)))
+        super.vehicleShoot(living, uuid, targetPos)
+    }
+
+    open fun beforeShoot(living: LivingEntity?, weaponName: String? = null) {
+        val level = living?.level()
+        if (level is ServerLevel) {
+            ParticleTool.spawnBigCannonMuzzleParticles(getShootVec("Main", 1f), getShootPos("Main", 1f), level, this)
+        }
+    }
+
+    open fun canBind() = false
+
+    companion object {
+        @JvmField
+        val SHOOT_VEC: EntityDataAccessor<Vector3f> =
+            SynchedEntityData.defineId(ArtilleryEntity::class.java, EntityDataSerializers.VECTOR3)
+
+        @JvmField
+        val DEPRESSED: EntityDataAccessor<Boolean> =
+            SynchedEntityData.defineId(ArtilleryEntity::class.java, EntityDataSerializers.BOOLEAN)
+
+        @JvmField
+        val TARGET_POS: EntityDataAccessor<BlockPos> =
+            SynchedEntityData.defineId(ArtilleryEntity::class.java, EntityDataSerializers.BLOCK_POS)
+
+        @JvmField
+        val RADIUS: EntityDataAccessor<Int> =
+            SynchedEntityData.defineId(ArtilleryEntity::class.java, EntityDataSerializers.INT)
+
+        @JvmField
+        val LOCK_TURRET: EntityDataAccessor<Boolean> =
+            SynchedEntityData.defineId(ArtilleryEntity::class.java, EntityDataSerializers.BOOLEAN)
+
+        @JvmField
+        val ORIGIN_POS: EntityDataAccessor<BlockPos> =
+            SynchedEntityData.defineId(ArtilleryEntity::class.java, EntityDataSerializers.BLOCK_POS)
+    }
+}
