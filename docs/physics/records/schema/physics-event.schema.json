@@ -1,0 +1,126 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://superbwarfare.invalid/schemas/physics-event.schema.json",
+  "title": "Tracked Vehicle Physics Event",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "event_id",
+    "recorded_at",
+    "project",
+    "repository",
+    "branch",
+    "kind",
+    "status",
+    "source_commit",
+    "summary",
+    "user_confirmed",
+    "mcp_sync",
+    "worktree_dirty"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "event_id": {
+      "type": "string",
+      "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$"
+    },
+    "recorded_at": { "type": "string", "format": "date" },
+    "project": { "const": "SuperbWarfare" },
+    "repository": { "const": "SuperbWarfare" },
+    "branch": { "type": "string", "minLength": 1 },
+    "kind": {
+      "enum": ["baseline", "decision", "stage", "test", "manual_gate", "vehicle", "mcp_sync"]
+    },
+    "stage_id": { "type": ["string", "null"] },
+    "vehicle_id": { "type": ["string", "null"] },
+    "status": {
+      "enum": [
+        "planned", "in_progress", "candidate", "wired", "auto_passed",
+        "waiting_manual", "manual_passed", "approved", "blocked", "failed"
+      ]
+    },
+    "source_commit": {
+      "type": "string",
+      "pattern": "^([0-9a-f]{40}|WORKTREE)$"
+    },
+    "core_commit": {
+      "type": ["string", "null"],
+      "pattern": "^([0-9a-f]{40}|WORKTREE)$"
+    },
+    "definition_sha256": {
+      "type": ["string", "null"],
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "model_sha256": {
+      "type": ["string", "null"],
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "worktree_dirty": { "type": "boolean" },
+    "changed_paths": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/repositoryPath" },
+      "uniqueItems": true
+    },
+    "tests": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["level", "name", "result"],
+        "properties": {
+          "level": { "enum": ["T0", "T1", "T2", "T3", "T4", "T5"] },
+          "name": { "type": "string", "minLength": 1 },
+          "command": { "type": ["string", "null"] },
+          "result": { "enum": ["pass", "fail", "not_run", "blocked"] },
+          "evidence_path": {
+            "type": ["string", "null"],
+            "anyOf": [
+              { "type": "null" },
+              { "$ref": "#/$defs/repositoryPath" }
+            ]
+          },
+          "evidence_sha256": {
+            "type": ["string", "null"],
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "failure_summary": { "type": ["string", "null"] }
+        }
+      }
+    },
+    "manual_gate": { "type": ["string", "null"], "enum": ["A", "B", "C", "D", null] },
+    "user_confirmed": { "type": "boolean" },
+    "supersedes": { "type": ["string", "null"] },
+    "mcp_sync": { "enum": ["not_applicable", "pending", "synced", "unavailable", "mismatch"] },
+    "summary": { "type": "string", "minLength": 1 },
+    "next_action": { "type": ["string", "null"] },
+    "references": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/repositoryPath" },
+      "uniqueItems": true
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "status": { "const": "manual_passed" } } },
+      "then": {
+        "properties": {
+          "user_confirmed": { "const": true },
+          "manual_gate": { "enum": ["A", "B", "C", "D"] }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "status": { "const": "approved" } } },
+      "then": { "properties": { "user_confirmed": { "const": true } } }
+    }
+  ],
+  "$defs": {
+    "repositoryPath": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Repository-relative path, or RepositoryName:path. No absolute or sibling-relative paths.",
+      "pattern": "^(?:[A-Za-z0-9_.-]+:)?(?:(?!\\.\\.(?:/|$))[A-Za-z0-9_.-]+/)*(?!\\.\\.(?:/|$))[A-Za-z0-9_.-]+/?$"
+    }
+  }
+}

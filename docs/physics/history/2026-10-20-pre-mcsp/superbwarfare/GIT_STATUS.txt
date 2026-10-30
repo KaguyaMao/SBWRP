@@ -1,0 +1,20 @@
+ M .gitignore
+ M AGENT.md
+ M docs/VEHICLE_PHYSICS_HANDOFF.md
+ M docs/VEHICLE_PHYSICS_PLAN.md
+ M src/main/kotlin/com/atsuishio/superbwarfare/command/CommandRegister.kt
+ M src/main/kotlin/com/atsuishio/superbwarfare/init/ModEntities.kt
+ M src/main/kotlin/com/atsuishio/superbwarfare/init/ModEntityRenderers.kt
+ M src/main/kotlin/com/atsuishio/superbwarfare/network/NetworkRegistry.kt
+ M src/main/resources/assets/superbwarfare/lang/en_us.json
+ M src/main/resources/assets/superbwarfare/lang/zh_cn.json
+?? .opencode/
+?? docs/physics/
+?? src/main/java/com/atsuishio/superbwarfare/client/debug/
+?? src/main/java/com/atsuishio/superbwarfare/gametest/SupportFieldGameTests.java
+?? src/main/kotlin/com/atsuishio/superbwarfare/client/debug/
+?? src/main/kotlin/com/atsuishio/superbwarfare/client/renderer/entity/SupportTestBodyRenderer.kt
+?? src/main/kotlin/com/atsuishio/superbwarfare/command/SbwDebugCommand.kt
+?? src/main/kotlin/com/atsuishio/superbwarfare/entity/misc/SupportTestBodyEntity.kt
+?? src/main/kotlin/com/atsuishio/superbwarfare/network/message/receive/HeightFieldDebugMessage.kt
+?? src/main/resources/data/superbwarfare_support/

@@ -1,4 +1,16 @@
-# SuperbWarfare 载具物理交接文档
+# 历史归档：SuperbWarfare 载具物理交接文档
+
+> **历史资料声明（2026-10-22）：** 本文属于旧车辆物理方案/交接资料，不是当前权威来源。
+> 当前权威文档为 `docs/physics/README.md`、`docs/physics/ARCHITECTURE.md`、
+> `docs/physics/CONSTRAINTS.md` 和 `docs/physics/IMPLEMENTATION_PLAN.md`。
+> 本文中的整侧悬挂、探针承载、高度场和预处理履带动画不得作为当前悬挂模型、
+> 载荷路径或 B1 验收依据。
+
+> 2026-10-19 起本文仅作历史交接记录；2026-10-20 起进一步撤销。
+> 当前有效入口为 `docs/physics/README.md`。
+> 本文中“不要拆成独立刚体”、探针承载、高度场和预处理履带动画与当前
+> SBW 定义 + Bullet 动态履带板方案冲突时，以 `docs/physics/` 为准。清理前快照见
+> `docs/physics/history/2026-10-20-pre-mcsp/`。
 
 更新时间：2026-10-11
 
@@ -133,4 +145,3 @@ grounded、速度和 DriveFrame，判断坐标/地形测试问题与真正物理
 用延时、直接 setPos、永久上升力或重新启用 SBW 姿态写入来掩盖问题。每个修复都要重新跑
 编译和 GameTest，并在最终提交前删除调试日志。
 ```
-

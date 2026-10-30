@@ -1,5 +1,12 @@
 # SuperbWarfare 项目架构指南
 
+> 履带物理工作的当前权威文档为 `docs/physics/README.md`、
+> `docs/physics/CONSTRAINTS.md` 和 `docs/physics/IMPLEMENTATION_PLAN.md`。
+> 新架构用 Bullet 复现 MCSP 履带物理，基础地形使用 Minecraft 方块 AABB，物理履带运行段
+> 与可见重复链节分离。高度场、探针承载和固定楔面已撤销。
+> 任何相关任务还应按 `docs/physics/SKILLS.md` 选择 `.opencode/skills/` 中的专项 workflow；
+> MCP/事件账本的权威性和实时跟进规则见 `docs/physics/MCP.md` 与 `MCP_OPERATIONS.md`。
+
 ## 概览
 
 SuperbWarfare 是一个 Minecraft Forge 1.20.1 军事题材模组。Kotlin/Java 混合开发（Kotlin 为主），使用 GeckoLib 做动画（未来要删除）和 Simple Bedrock Model 渲染，Curios 做饰品栏位，Cloth Config 做配置界面，Rhino 做 JS 脚本引擎。

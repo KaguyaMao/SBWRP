@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "event_id": "replace-with-unique-event-id",
+  "recorded_at": "2026-10-19",
+  "project": "SuperbWarfare",
+  "repository": "SuperbWarfare",
+  "branch": "Physic-Update",
+  "kind": "test",
+  "stage_id": "D0",
+  "vehicle_id": "superbwarfare:ztz_99a",
+  "status": "not_run",
+  "source_commit": "WORKTREE",
+  "core_commit": null,
+  "definition_sha256": null,
+  "model_sha256": null,
+  "worktree_dirty": true,
+  "changed_paths": [],
+  "tests": [
+    {
+      "level": "T0",
+      "name": "replace-with-test-name",
+      "command": null,
+      "result": "not_run",
+      "evidence_path": null,
+      "evidence_sha256": null,
+      "failure_summary": null
+    }
+  ],
+  "manual_gate": null,
+  "user_confirmed": false,
+  "supersedes": null,
+  "mcp_sync": "pending",
+  "summary": "Replace with factual, concise event summary.",
+  "next_action": null,
+  "references": []
+}

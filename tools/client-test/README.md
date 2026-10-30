@@ -14,7 +14,7 @@ LEGION_SWAP_SIDES=1 ./tools/client-test/run-client.sh
 
 或把 `tools/client-test/pad-map.json` 里的 `swap_sides` 改成 `true`。按键对不上时用 `--dump` 看原始事件，再改 `left_buttons` / `right_buttons`。
 
-如果在 HHD 里把固件切回 xinput，桥会让路，Controllable 直接用 HHD 的虚拟手柄。
+HHD 的 `xbox_elite` 模式不会再发一只名字是 Xbox 的虚拟手柄，固件直接露出 `Generic X-Box pad`（`17ef:61eb`）。这只手柄的 GUID 不在 Controllable 自带库里，所以桥会把它镜像成 SDL 认识的 Xbox 360，并把它自己的 GUID 写进 `gamecontrollerdb.txt`。只有 HHD 已经发布了完整虚拟手柄时，桥才让路。
 
 `runServer` / `runGameTestServer` 默认不加载这两个客户端测试依赖；可以显式使用
 `-PclientTestMods=false`。Framework 扫描 Controllable 配置时会涉及客户端类，

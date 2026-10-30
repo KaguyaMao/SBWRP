@@ -1,0 +1,2 @@
+8b0e4b26d78d031cbc7e70a66af46acebd88d78bf9d9ffc8a5c38da145ad1faa  docs/physics/history/2026-10-27-step-assist/TrackedStepAssist.kt
+d3e7c5bb8c7f8694d5ee026ffb7770769018cb84f2d59bc04031e7fdc8b6f990  docs/physics/history/2026-10-27-step-assist/TrackedStepAssistTest.kt

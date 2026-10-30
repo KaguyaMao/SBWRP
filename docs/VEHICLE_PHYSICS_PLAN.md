@@ -1,4 +1,17 @@
-# 载具物理后续实施计划
+# 历史归档：载具物理后续实施计划
+
+> **历史资料声明（2026-10-22）：** 本文属于旧车辆物理方案/交接资料，不是当前权威来源。
+> 当前权威文档为 `docs/physics/README.md`、`docs/physics/ARCHITECTURE.md`、
+> `docs/physics/CONSTRAINTS.md` 和 `docs/physics/IMPLEMENTATION_PLAN.md`。
+> 本文中的整侧悬挂、探针承载、高度场和预处理履带动画不得作为当前悬挂模型、
+> 载荷路径或 B1 验收依据。
+
+> 2026-10-19 起本文仅作历史记录；2026-10-20 起进一步撤销。
+> 当前履带物理计划见 `docs/physics/IMPLEMENTATION_PLAN.md`。
+> 本文中的探针承载、固定坡道、高度场、预处理履带动画和左右整体悬挂不能作为新架构方案。
+> 新架构以 SBW 自有车型/悬挂定义为权威、在 Bullet 上实现履带物理，基础地形使用 Minecraft 方块 AABB，
+> 物理履带运行段与可见重复链节分离。清理前快照见
+> `docs/physics/history/2026-10-20-pre-mcsp/`。
 
 这份计划按风险从高到低排列。当前实现已经覆盖大部分架构，但自动化测试仍未全绿，因此后续模型应按阶段推进，不要同时调大量参数。
 
@@ -135,4 +148,3 @@ rg -n "physics-probe|physics-debug|debugContact|debugStep|debugReset" src || tru
 
 - Machine-Max：<https://github.com/Sweetzonzi/Machine-Max>
 - ywzj_vehicle：<https://github.com/YWZJ-Studio/ywzj_vehicle>
-
