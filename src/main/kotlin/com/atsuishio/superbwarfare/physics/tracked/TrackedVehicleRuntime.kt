@@ -13,6 +13,7 @@ import cn.solarmoon.spark_core.physics.body.onPrePhysicsTick
 import cn.solarmoon.spark_core.physics.body.onResolvedContact
 import cn.solarmoon.spark_core.physics.body.owner
 import cn.solarmoon.spark_core.physics.level.PhysicsLevel
+import cn.solarmoon.spark_core.physics.level.SolverIterationRequests
 import cn.solarmoon.spark_core.physics.track.TrackRunAssembly
 import cn.solarmoon.spark_core.physics.track.TrackRunLinkSpec
 import cn.solarmoon.spark_core.physics.track.TrackRunRuntime
@@ -26,6 +27,7 @@ import com.jme3.bullet.collision.PhysicsCollisionObject
 import com.jme3.bullet.collision.shapes.CylinderCollisionShape
 import com.jme3.bullet.joints.New6Dof
 import com.jme3.bullet.objects.PhysicsRigidBody
+import cn.solarmoon.spark_core.util.PPhase
 import cn.solarmoon.spark_core.util.Subscription
 import net.minecraftforge.common.MinecraftForge
 import net.minecraftforge.eventbus.api.SubscribeEvent
@@ -170,6 +172,11 @@ class TrackedVehicleRuntime(
     @Volatile private var mountJoints: List<New6Dof> = emptyList()
     /** One runtime per run, in compiled run order, per side. */
     @Volatile private var runtimes: Map<TrackedSide, List<TrackRunRuntime>> = emptyMap()
+    /** Envelope belts, one per side whose spec has one. Physics thread only, except the counts. */
+    @Volatile private var belts: Map<TrackedSide, TrackedDynamicBelt> = emptyMap()
+    /** Wheels whose spring and damper live in the mount joint (envelope belts); the rest are explicit rows. */
+    private val jointSprungWheels = java.util.concurrent.ConcurrentHashMap.newKeySet<Pair<TrackedSide, Int>>()
+    private var lastSegmentationTick = -1L
     /** External run-end constraints, two per run. */
     @Volatile private var endJoints: List<New6Dof> = emptyList()
     private val endJointLock = Any()
@@ -254,18 +261,63 @@ class TrackedVehicleRuntime(
         val window = samplingWindow(pose.center) ?: return
         requestedTerrainWindow = window
         level.terrainManager.requestRegion(terrainRegionRequestId, window)
-        if (terrainReady && (installedTerrainWindow?.let { !TrackedTerrainSampler.sameWindow(it, window) } != false ||
-                installedTerrainRevision != level.terrainManager.revisionTokenAt(window))) {
+        if (!terrainReady) return
+        val installedCenter = installedTerrainCenter
+        val installed = installedTerrainWindow
+        if (installedCenter == null || installed == null ||
+            !TrackedTerrainSampler.covers(installedCenter, pose.center)
+        ) {
+            // The vehicle drove off the installed mesh before its replacement
+            // arrived. This is the only case that may hold the assembly.
             markTerrainInvalid()
+            return
+        }
+        // A moved window or an edited block only asks for a new mesh. The old
+        // mesh still covers the running gear and stays installed until the swap,
+        // so the vehicle keeps its contacts and is never frozen for a rebuild.
+        if (!TrackedTerrainSampler.sameWindow(installed, window) ||
+            installedTerrainRevision != level.terrainManager.revisionTokenAt(window)
+        ) {
+            terrainRebuildRequested.set(true)
         }
     }
 
+    /** Centre of the window currently requested; it moves only past [TrackedTerrainSampler.REBUILD_DISTANCE]. */
+    @Volatile private var terrainWindowCenter: Vec3? = null
+
+    /** Centre of the window the installed mesh was built for. */
+    @Volatile private var installedTerrainCenter: Vec3? = null
+
+    private fun windowCenterFor(center: Vec3): Vec3 {
+        val current = terrainWindowCenter
+        if (current != null && !TrackedTerrainSampler.wantsRebuild(current, center)) return current
+        val next = TrackedTerrainSampler.snap(center)
+        terrainWindowCenter = next
+        return next
+    }
+
     private fun samplingWindow(center: Vec3): AABB? = try {
-        TrackedTerrainSampler.window(center, terrainEnvelope, spec.terrain)
+        TrackedTerrainSampler.window(windowCenterFor(center), terrainEnvelope, spec.terrain)
     } catch (error: IllegalArgumentException) {
         terrainMissingReason = error.message
         markTerrainInvalid()
         null
+    }
+
+    /**
+     * A plan could not be installed (stale window, changed revision, rejected).
+     * While an installed mesh still covers the vehicle this only asks for a new
+     * build; removing the mesh here is what used to freeze the vehicle on every
+     * race between the builder and a moving window.
+     */
+    private fun dropTerrainPlan() {
+        val center = installedTerrainCenter
+        val pose = publishedTerrainPose
+        if (terrainReady && center != null && pose != null && TrackedTerrainSampler.covers(center, pose.center)) {
+            terrainRebuildRequested.set(true)
+        } else {
+            markTerrainInvalid()
+        }
     }
 
     fun sampleAndApplyTerrain(world: Level, center: Vec3, force: Boolean = false) {
@@ -314,7 +366,6 @@ class TrackedVehicleRuntime(
                     requestId = requestId,
                     runtimeGeneration = buildGeneration,
                     rampGate = gate,
-                    gear = publishedGearProbes,
                 ) { built ->
                     terrainBuildNanos = System.nanoTime() - started
                     if (built is TrackedTerrainSampleResult.Ready) {
@@ -372,7 +423,7 @@ class TrackedVehicleRuntime(
                         if (requestedTerrainWindow?.let { TrackedTerrainSampler.sameWindow(window, it) } != true || revision == null) {
                             terrainStalePlanCount += 1
                             terrainMissingReason = "stale terrain plan:${next.requestId}"
-                            markTerrainInvalid()
+                            dropTerrainPlan()
                             continue
                         }
                         val installed = level.terrainManager.withRevisionToken(window, revision) {
@@ -390,21 +441,26 @@ class TrackedVehicleRuntime(
                                 terrainAppliedRevision = next.terrainRevisionHash
                                 installedTerrainRevision = next.terrainRevision
                                 installedTerrainWindow = window
+                                installedTerrainCenter =
+                                    TrackedTerrainSampler.centerOf(window, terrainEnvelope, spec.terrain)
                                 installedRampBucket = next.rampHeadingBucket
                                 terrainReady = true
                                 terrainMissingReason = null
-                                releaseTerrainHold(restoreVelocity = true)
+                                if (terrainBodiesHeld.get()) releaseTerrainHold(restoreVelocity = true)
+                                // A sleeping vehicle is not woken by its ground being replaced: wake the
+                                // assembly when the mesh really changed, so it settles on the new surface.
+                                if (result != TerrainMeshInstallResult.REUSED) wakeAssembly()
                             }
                             result
                         }
                         if (installed == null) {
                             terrainStalePlanCount += 1
                             terrainMissingReason = "terrain revision changed before install:${next.requestId}"
-                            markTerrainInvalid()
+                            dropTerrainPlan()
                             continue
                         }
                         if (installed == TerrainMeshInstallResult.REJECTED) {
-                            markTerrainInvalid()
+                            dropTerrainPlan()
                             continue
                         }
                         if (installed == TerrainMeshInstallResult.REPLACED) {
@@ -461,13 +517,16 @@ class TrackedVehicleRuntime(
      */
     private fun rampGateFor(window: AABB): RampGate {
         val pose = publishedTerrainPose
-        val lateral = maxOf(terrainEnvelope.halfX, 1.0) + 0.75
+        // The window centre may be up to COVER_DISTANCE from the vehicle before
+        // the next rebuild, so the corridor carries that slack too.
+        val lateral = maxOf(terrainEnvelope.halfX, 1.0) + 0.75 + TrackedTerrainSampler.COVER_DISTANCE
         return RampGate.forVehicle(
             (window.minX + window.maxX) * 0.5,
             (window.minZ + window.maxZ) * 0.5,
             pose?.forwardX ?: 0.0,
             pose?.forwardZ ?: 1.0,
             lateral,
+            previousBucket = installedRampBucket.takeIf { it != Int.MIN_VALUE },
         )
     }
 
@@ -506,6 +565,13 @@ class TrackedVehicleRuntime(
         terrainWait.holdAll(terrainBodies)
     }
 
+    /** Wake the hull, every wheel and every belt body. Physics thread. */
+    private fun wakeAssembly() {
+        if (!chassis.isActive) chassis.activate(true)
+        for (bodies in wheelBodies.values) for (body in bodies) if (!body.isActive) body.activate(true)
+        for (belt in belts.values) for (piece in belt.pieces) if (!piece.body.isActive) piece.body.activate(true)
+    }
+
     /** Register a body as part of the assembly and hold it if terrain is missing. */
     private fun trackTerrainBody(body: PhysicsRigidBody) {
         terrainBodies += body
@@ -523,10 +589,38 @@ class TrackedVehicleRuntime(
 
     /** Number of dynamic wheel bodies currently registered, zero before create. */
     val wheelCount: Int get() = wheelBodies.values.sumOf { it.size }
+    val physicsTickCount: Long get() = level.tickCount
     /** Number of live run runtimes, zero before create. */
-    val runCount: Int get() = runtimes.values.sumOf { it.size }
+    val runCount: Int get() = runtimes.values.sumOf { it.size } + belts.values.sumOf { it.publishedBodyCount }
     /** Number of external end constraints, zero before create. */
-    val endJointCount: Int get() = endJoints.size
+    val endJointCount: Int get() = endJoints.size + belts.values.sumOf { it.publishedJointCount }
+
+    /** Bottom pieces per side of the envelope belt; empty for the other topologies. */
+    fun beltBottomPieces(): Map<TrackedSide, Int> = belts.mapValues { it.value.publishedBottomPieces }
+
+    /** Current suspension position snapshot, sampled on the physics thread. */
+    fun suspensionTravelSnapshot(): Map<TrackedSide, List<Pair<Int, Double>>> {
+        level.assertPhysicsThread()
+        val bodies = wheelBodies
+        return TrackedSide.entries.associateWith { side ->
+            spec.side(side).wheels.mapIndexedNotNull { index, wheel ->
+                val body = bodies[side]?.getOrNull(index) ?: return@mapIndexedNotNull null
+                wheel.index to travelOf(wheel, body).toDouble()
+            }
+        }
+    }
+
+    /** Rest-arc topology of the envelope bottom pieces, for deterministic diagnostics. */
+    fun beltTopology(): Map<TrackedSide, String> = belts.mapValues { it.value.publishedTopology }
+
+    /** Repartition event totals since belt construction. */
+    fun beltRepartitionCounts(): Map<TrackedSide, String> = belts.mapValues { it.value.publishedRepartitionCounts }
+
+    /** Last segmentation summary per side. */
+    fun beltSegmentation(): Map<TrackedSide, String> = belts.mapValues { it.value.publishedSegmentation }
+
+    /** Worst belt pin gap per side, metres, from the last segmentation pass. */
+    fun beltWorstPinGaps(): Map<TrackedSide, Double> = belts.mapValues { it.value.publishedWorstGapM }
 
     /**
      * Native objects this runtime still owns, counted from the rollback ledger.
@@ -603,6 +697,11 @@ class TrackedVehicleRuntime(
                         val joint = TrackedJointFactory.create(plan, chassis, wheelBody) { created ->
                             ledger.recordJoint(created)
                         }
+                        val springRow = mount.springRow
+                        if (compiled.envelope != null && springRow != null) {
+                            TrackedSuspensionSprings.configure(joint, springRow)
+                            jointSprungWheels += side to mount.wheelIndex
+                        }
                         level.addJoint(joint)
                         mounts += joint
                     }
@@ -630,9 +729,27 @@ class TrackedVehicleRuntime(
                     val (origin, rotation) = chassisPose()
                     val created = LinkedHashMap<TrackedSide, List<TrackRunRuntime>>()
                     val futures = ArrayList<CompletableFuture<Void>>()
+                    val createdBelts = LinkedHashMap<TrackedSide, TrackedDynamicBelt>()
                     for (side in TrackedSide.entries) {
                         val compiled = spec.side(side)
-                        val specs = TrackedRunSpecs.compileRuns(compiled, spec.vehicleId, spec.drivetrain.friction)
+                        val envelope = compiled.envelope
+                        if (envelope != null) {
+                            // The envelope belt owns its bodies; no core TrackRun.
+                            val sideWheels = wheelBodies[side] ?: error("no wheels for $side")
+                            val byIndex = compiled.wheels.indices.associate { compiled.wheels[it].index to sideWheels[it] }
+                            val belt = TrackedDynamicBelt(
+                                compiled, envelope, RuntimeBeltWorld(side), chassis, byIndex,
+                                "sbw_track_${spec.vehicleId}_${side.name.lowercase()}_belt",
+                            )
+                            createdBelts[side] = belt
+                            belt.build(origin, rotation, chassis.getLinearVelocity(null), chassis.getAngularVelocity(null))
+                            // The wrap arcs are belt surface on the guide-wheel bodies:
+                            // they take the same terrain contact drive as the spans.
+                            for (wheelIndex in envelope.wraps.keys) registerRunBody(byIndex.getValue(wheelIndex), side)
+                            created[side] = emptyList()
+                            continue
+                        }
+                        val specs = TrackedRunSpecs.compilePhysicalRuns(compiled, spec.vehicleId, spec.drivetrain.friction)
                         val list = ArrayList<TrackRunRuntime>(specs.size)
                         specs.forEach { local ->
                             val placed = place(local, origin, rotation)
@@ -646,6 +763,7 @@ class TrackedVehicleRuntime(
                         created[side] = list
                     }
                     runtimes = created
+                    belts = createdBelts
                     if (failCreateAfterRuns) {
                         failCreateAfterRuns = false
                         error("injected failure after runs")
@@ -668,51 +786,31 @@ class TrackedVehicleRuntime(
                 val futures = ArrayList<CompletableFuture<*>>()
                 for (side in TrackedSide.entries) {
                     val compiled = spec.side(side)
+                    if (compiled.envelope != null) continue
                     val list = runtimes[side] ?: error("no runtimes for $side")
                     val wheels = wheelBodies[side] ?: error("no wheels for $side")
                     val byIndex = compiled.wheels.indices.associate { compiled.wheels[it].index to wheels[it] }
-                    compiled.runs.forEachIndexed { index, run ->
+                    compiled.physicalRuns.forEachIndexed { index, run ->
                         val runtime = list[index]
-                        for (attachment in run.attachments) {
-                            val plan = attachment.joint
-                            futures += runtime.withLinkBodies { bodies ->
-                                ensureCreating()
-                                val runBody = bodies.single()
-                                trackTerrainBody(runBody)
-                                if (runSides.putIfAbsent(runBody, side) == null) {
-                                    runBody.onResolvedContact { event ->
-                                        val other = event.other
-                                        val terrain =
-                                            other.collisionGroup and TrackedTerrainCollision.TERRAIN_MESH != 0
-                                        if (!terrain) return@onResolvedContact
-                                        val snapshot = event.snapshot
-                                        val impulse = snapshot.normalImpulse
-                                        val accum = sideAccum.computeIfAbsent(side) { SideAccum() }
-                                        if (impulse > 0f && snapshot.normal.y > 0.4) {
-                                            noteRunSupport(
-                                                side,
-                                                impulse.toDouble(),
-                                                tangentialForwardNs(snapshot.impulse, snapshot.normal),
-                                            )
-                                            accum.normal += impulse.toDouble()
-                                            // Longitudinal ground traction only. A wall
-                                            // hit is a real contact but its forward
-                                            // impulse is resistance, not drive: including
-                                            // it would throttle the vehicle for touching a
-                                            // wall, which MCSP's per-slot traction does
-                                            // not do.
-                                            val forward = TrackedVehicleFrame.worldForward(
-                                                chassis.getPhysicsRotation(null).toRotationMatrix(),
-                                            )
-                                            val impulseVec = snapshot.impulse
-                                            accum.traction += impulseVec.x * forward.x +
-                                                impulseVec.y * forward.y +
-                                                impulseVec.z * forward.z
-                                        }
-                                    }
+                        futures += runtime.withLinkBodies { bodies ->
+                            ensureCreating()
+                            for ((linkIndex, runBody) in bodies.withIndex()) {
+                                debugRunBodies["${side.name}:$index:$linkIndex"] = runBody
+                                if (run.inertiaScale != 1.0 && run.inertiaScale.isFinite() && run.inertiaScale > 0.0) {
+                                    // Statics are unchanged; only rotational response is
+                                    // slowed so a light unit under a heavy wheel does not
+                                    // spin out of its pins inside one solver step.
+                                    val inverse = runBody.getInverseInertiaLocal(null)
+                                    runBody.setInverseInertiaLocal(inverse.mult((1.0 / run.inertiaScale).toFloat()))
                                 }
-                                val bodyA = resolve(plan.bodyA, runBody, byIndex, side)
-                                val bodyB = resolve(plan.bodyB, runBody, byIndex, side)
+                                trackTerrainBody(runBody)
+                                registerRunBody(runBody, side)
+                            }
+                            for (external in run.externals) {
+                                val plan = external.plan
+                                val linkBody = bodies[external.link]
+                                val bodyA = resolve(plan.bodyA, linkBody, byIndex, side)
+                                val bodyB = resolve(plan.bodyB, linkBody, byIndex, side)
                                 val joint = TrackedJointFactory.create(plan, bodyA, bodyB) { created ->
                                     ledger.recordJoint(created)
                                 }
@@ -736,6 +834,8 @@ class TrackedVehicleRuntime(
                     } else {
                         state.set(State.ACTIVE)
                         ACTIVE_RUNTIMES += this
+                        if (spec.solverSubsteps > 1) level.solverSubsteps.request(this, spec.solverSubsteps)
+                        if (spec.solverIterations > SolverIterationRequests.DEFAULT) level.solverIterations.request(this, spec.solverIterations)
                         lastError = null
                         registerContactListener()
                         registerSupportWindow()
@@ -757,6 +857,8 @@ class TrackedVehicleRuntime(
                     if (cleanupError != null) error.addSuppressed(cleanupError)
                     synchronized(this) {
                         ACTIVE_RUNTIMES -= this
+                        level.solverSubsteps.release(this)
+                        level.solverIterations.release(this)
                         clearPublishedState()
                         state.set(State.FAILED)
                     }
@@ -802,6 +904,8 @@ class TrackedVehicleRuntime(
         pendingTerrainPlan.set(null)
         requestedTerrainWindow = null
         installedTerrainWindow = null
+        installedTerrainCenter = null
+        terrainWindowCenter = null
         installedTerrainRevision = null
         installedRampBucket = Int.MIN_VALUE
         publishedTerrainPose = null
@@ -812,9 +916,14 @@ class TrackedVehicleRuntime(
         wheelBodies = emptyMap()
         mountJoints = emptyList()
         runtimes = emptyMap()
+        // The ledger owns and removes every belt body and joint; only drop the views.
+        belts = emptyMap()
+        jointSprungWheels.clear()
+        lastSegmentationTick = -1L
         synchronized(endJointLock) { endJoints = emptyList() }
         rows = emptyMap()
         runSides.clear()
+        debugRunBodies.clear()
         beltSupported = false
         sideAccum.clear()
         sideWindows = emptyMap()
@@ -881,11 +990,8 @@ class TrackedVehicleRuntime(
                 val bodies = wheels[side] ?: continue
                 compiled.wheels.forEachIndexed { index, wheel ->
                     val body = bodies[index]
-                    val local = Vector3f(
-                        wheel.assemblyCenter.x.toFloat(),
-                        wheel.assemblyCenter.y.toFloat(),
-                        wheel.assemblyCenter.z.toFloat(),
-                    )
+                    val seat = seatCenter(compiled, wheel)
+                    val local = Vector3f(seat.x.toFloat(), seat.y.toFloat(), seat.z.toFloat())
                     val worldOffset = rotationMatrix.mult(local, Vector3f())
                     body.clearForces()
                     body.setPhysicsLocation(origin.add(worldOffset))
@@ -894,24 +1000,23 @@ class TrackedVehicleRuntime(
                     body.setAngularVelocity(hullAngular)
                     body.activate(true)
                 }
+                // The envelope belt is rebuilt at rest around the re-seated wheels:
+                // one bottom piece again, every joint at zero error.
+                belts[side]?.rebuild(origin, rotation, hullVelocity, hullAngular)
                 // Runs are re-seated through the Core runtime so its snapshot and
                 // pose epoch stay authoritative rather than being written behind
                 // its back.
                 currentRuntimes[side]?.forEachIndexed { index, runtime ->
-                    val run = compiled.runs[index]
-                    val offset = Vector3f(
-                        run.center.x.toFloat(),
-                        run.center.y.toFloat(),
-                        run.center.z.toFloat(),
-                    )
-                    val worldOffset = rotationMatrix.mult(offset, Vector3f())
-                    val world = origin.add(worldOffset)
-                    val combined = Quaternion(rotation).mult(
-                        Quaternion(run.rotation.x, run.rotation.y, run.rotation.z, run.rotation.w),
-                    )
-                    combined.normalizeLocal()
+                    val run = compiled.physicalRuns[index]
                     runtime.resetNow(
-                        listOf(
+                        run.links.map { link ->
+                            val offset = Vector3f(link.center.x.toFloat(), link.center.y.toFloat(), link.center.z.toFloat())
+                            val worldOffset = rotationMatrix.mult(offset, Vector3f())
+                            val world = origin.add(worldOffset)
+                            val combined = Quaternion(rotation).mult(
+                                Quaternion(link.rotation.x, link.rotation.y, link.rotation.z, link.rotation.w),
+                            )
+                            combined.normalizeLocal()
                             cn.solarmoon.spark_core.physics.track.TrackRunLinkFrame(
                                 position = Vec3(world.x.toDouble(), world.y.toDouble(), world.z.toDouble()),
                                 rotationX = combined.x,
@@ -930,8 +1035,8 @@ class TrackedVehicleRuntime(
                                 ),
                                 active = true,
                                 colliding = false,
-                            ),
-                        ),
+                            )
+                        },
                     )
                 }
             }
@@ -982,15 +1087,25 @@ class TrackedVehicleRuntime(
                 if (row != null) {
                     val travel = travelOf(wheel, body)
                     val force = PhysicsSuspensionRow.force(row, SuspensionRowState(travel, relative))
-                    applyMountForce(chassis, body, axis, force, body.getPhysicsLocation(null))
+                    // A joint-sprung wheel already carries its spring and mean damper in the
+                    // mount joint; only the rest of the row is applied from here.
+                    val applied = if ((side to wheel.index) in jointSprungWheels) {
+                        TrackedSuspensionSprings.residual(row, travel, relative)
+                    } else {
+                        force
+                    }
+                    applyMountForce(chassis, body, axis, applied, body.getPhysicsLocation(null))
                     recordTelemetry(wheel.index, travel, force)
                 } else {
-                    // Tensioned idler: preload pushes along the travel axis and
-                    // damping opposes the relative rate. Sign follows the mount
-                    // axis, which the compiler derived from authored data.
+                    // Tensioned idler. applyMountForce pushes the wheel along
+                    // -axis for a positive force, exactly as a compressed spring
+                    // row does, so the authored axis points into the belt loop and
+                    // the preload pushes the idler outward. Damping must add to the
+                    // force when the wheel moves along +axis, like a row's
+                    // compression damping; subtracting it fed motion instead.
                     val preload = mount.preloadN?.toFloat() ?: return@forEachIndexed
                     val damping = mount.dampingNsPerM?.toFloat() ?: 0f
-                    val force = preload - damping * relative
+                    val force = preload + damping * relative
                     if (force.isFinite()) {
                         applyMountForce(chassis, body, axis, force, body.getPhysicsLocation(null))
                         recordTelemetry(wheel.index, travelOf(wheel, body), force)
@@ -1042,6 +1157,8 @@ class TrackedVehicleRuntime(
                 }
                 State.ACTIVE -> {
                     ACTIVE_RUNTIMES -= this
+                    level.solverSubsteps.release(this)
+                    level.solverIterations.release(this)
                     state.set(State.CLOSING)
                     // Published views are dropped *after* teardown decided what
                     // to remove; clearing them early would hide objects from the
@@ -1049,6 +1166,8 @@ class TrackedVehicleRuntime(
                 }
                 State.CREATING -> {
                     ACTIVE_RUNTIMES -= this
+                    level.solverSubsteps.release(this)
+                    level.solverIterations.release(this)
                     // The create chain keeps running, but it cannot commit
                     // against a closing state and will roll itself back. Wait
                     // for that before tearing the ledger down a second time.
@@ -1113,6 +1232,8 @@ class TrackedVehicleRuntime(
                 return
             }
             ACTIVE_RUNTIMES -= this
+            level.solverSubsteps.release(this)
+            level.solverIterations.release(this)
             state.set(State.CLOSING)
         }
         try {
@@ -1149,15 +1270,11 @@ class TrackedVehicleRuntime(
         origin: Vector3f,
         rotation: Quaternion,
     ): PhysicsRigidBody {
-        val shape = CylinderCollisionShape(
-            Vector3f(wheel.halfWidth.toFloat(), wheel.radius.toFloat(), wheel.radius.toFloat()),
-            PhysicsSpace.AXIS_X,
-        ).apply { margin = .001f }
-        val local = Vector3f(
-            wheel.assemblyCenter.x.toFloat(),
-            wheel.assemblyCenter.y.toFloat(),
-            wheel.assemblyCenter.z.toFloat(),
-        )
+        val compiled = spec.side(side)
+        // A guide wheel the envelope belt wraps carries its wrap chords.
+        val shape = TrackedDynamicBelt.wheelShape(compiled, wheel)
+        val seat = seatCenter(compiled, wheel)
+        val local = Vector3f(seat.x.toFloat(), seat.y.toFloat(), seat.z.toFloat())
         val world = origin.add(rotation.toRotationMatrix().mult(local, Vector3f()))
         return PhysicsRigidBody(shape, wheel.massKg.toFloat()).apply {
             name = "sbw_track_${spec.vehicleId}_${side.name.lowercase()}_wheel_${wheel.index}"
@@ -1170,7 +1287,10 @@ class TrackedVehicleRuntime(
             // load path: runTerrain must still be proven before wheel-terrain
             // contact can be removed. Raw block AABB terrain stays excluded.
             setCollideWithGroups(TrackedTerrainCollision.TERRAIN_MESH or CollisionGroups.TRACK_LINK)
-            collideWithOwnerGroups = CollisionGroups.TRACK_LINK
+            // Own runs are joined to this wheel by the run-end constraints. A
+            // second, contact-based coupling would trade the load with the
+            // joint from substep to substep.
+            collideWithOwnerGroups = CollisionGroups.NONE
             friction = spec.drivetrain.friction.toFloat()
             restitution = 0f
             setDamping(.05f, .1f)
@@ -1184,11 +1304,87 @@ class TrackedVehicleRuntime(
             setProtectGravity(true)
             setGravity(gravity)
             isContactResponse = true
+            // The cylinder's own inertia; wrap chords are massless belt surface.
+            if (compiled.envelope != null) setInverseInertiaLocal(TrackedDynamicBelt.wheelInverseInertia(wheel))
             setPhysicsLocation(world)
             setPhysicsRotation(rotation)
         }.also {
             trackTerrainBody(it)
             it.onResolvedContact { event -> noteTerrainSupport(SupportSource.WHEEL, side, event) }
+        }
+    }
+
+    /**
+     * Where a wheel is seated at creation and reset: the envelope belt's fitted
+     * centre (road wheels at their static sag) when the side has one, otherwise
+     * the bind pose. Mount frames stay at the bind pose; a sprung wheel simply
+     * starts part-way up its free travel, already carrying its share.
+     */
+    private fun seatCenter(compiled: CompiledTrackSide, wheel: CompiledWheel): Vec3 =
+        compiled.envelope?.wheelCenters?.get(wheel.index) ?: wheel.assemblyCenter
+
+    /** Physics-thread [BeltWorld] for one side: level, rollback ledger, terrain hold and contact drive. */
+    private inner class RuntimeBeltWorld(private val side: TrackedSide) : BeltWorld {
+        override fun configure(body: PhysicsRigidBody) {
+            // Record first so a failure in configuration still leaves an owner.
+            ledger.recordBody(body)
+            body.owner = host
+            body.collisionGroup = CollisionGroups.TRACK_LINK
+            body.setCollideWithGroups(TrackedTerrainCollision.TERRAIN_MESH or CollisionGroups.WHEEL or CollisionGroups.CHASSIS)
+            // Same owner: terrain mesh only, never its own wheels or hull.
+            body.collideWithOwnerGroups = TrackedTerrainCollision.TERRAIN_MESH
+            body.friction = spec.drivetrain.friction.toFloat()
+            body.setSleepingThresholds(.05f, .05f)
+            body.setProtectGravity(true)
+            body.setGravity(gravity)
+            body.isContactResponse = true
+        }
+
+        override fun addBody(body: PhysicsRigidBody) {
+            level.addBody(body)
+            trackTerrainBody(body)
+            registerRunBody(body, side)
+        }
+
+        override fun removeBody(body: PhysicsRigidBody) {
+            runSides.remove(body)
+            terrainBodies -= body
+            terrainWait.release(body)
+            level.removeBody(body)
+            ledger.releaseBody(body)
+        }
+
+        override fun recordJoint(joint: New6Dof) = ledger.recordJoint(joint)
+
+        override fun addJoint(joint: New6Dof) {
+            level.addJoint(joint)
+        }
+
+        override fun removeJoint(joint: New6Dof) {
+            level.removeJoint(joint)
+            ledger.releaseJoint(joint)
+        }
+
+        override fun terrainRay(from: Vector3f, to: Vector3f): Float? {
+            val terrain = terrainProxy.installedBody ?: return null
+            return level.world.rayTest(from, to).filter { it.collisionObject === terrain }.minOfOrNull { it.hitFraction }
+        }
+    }
+
+    /**
+     * Split and merge the envelope belts once per game frame, before its first
+     * substep. Topology never changes inside a Bullet update.
+     */
+    private fun scheduleSegmentation() {
+        if (belts.isEmpty()) return
+        level.submitDeduplicatedTask("tracked belt segmentation ${spec.vehicleId}@${System.identityHashCode(this)}", PPhase.FRAME_PRE) {
+            if (state.get() != State.ACTIVE || belts.isEmpty()) return@submitDeduplicatedTask
+            val now = level.tickCount
+            val elapsed = if (lastSegmentationTick < 0) 0L else now - lastSegmentationTick
+            lastSegmentationTick = now
+            if (!terrainReady) return@submitDeduplicatedTask
+            val dt = elapsed.toDouble() / PhysicsLevel.TPS
+            for (belt in belts.values) belt.updateSegmentation(dt)
         }
     }
 
@@ -1202,6 +1398,28 @@ class TrackedVehicleRuntime(
     private fun runGravity(): Vec3 = Vec3(gravity.x.toDouble(), gravity.y.toDouble(), gravity.z.toDouble())
 
     /** Transform one chassis-local run spec into world space. */
+    /** Mark [runBody] as a belt body of [side] and listen for its terrain support. */
+    private fun registerRunBody(runBody: PhysicsRigidBody, side: TrackedSide) {
+        if (runSides.putIfAbsent(runBody, side) != null) return
+        runBody.onResolvedContact { event ->
+            val other = event.other
+            val terrain = other.collisionGroup and TrackedTerrainCollision.TERRAIN_MESH != 0
+            if (!terrain) return@onResolvedContact
+            val snapshot = event.snapshot
+            val impulse = snapshot.normalImpulse
+            val accum = sideAccum.computeIfAbsent(side) { SideAccum() }
+            if (impulse > 0f && snapshot.normal.y > 0.4) {
+                noteRunSupport(side, impulse.toDouble(), tangentialForwardNs(snapshot.impulse, snapshot.normal))
+                accum.normal += impulse.toDouble()
+                // Longitudinal ground traction only. A wall hit is a real contact
+                // but its forward impulse is resistance, not drive.
+                val forward = TrackedVehicleFrame.worldForward(chassis.getPhysicsRotation(null).toRotationMatrix())
+                val impulseVec = snapshot.impulse
+                accum.traction += impulseVec.x * forward.x + impulseVec.y * forward.y + impulseVec.z * forward.z
+            }
+        }
+    }
+
     private fun place(local: TrackRunSpec, origin: Vector3f, rotation: Quaternion): TrackRunSpec {
         val links = local.links.map { link ->
             val offset = Vector3f(
@@ -1329,7 +1547,8 @@ class TrackedVehicleRuntime(
         level.assertPhysicsThread()
         if (state.get() != State.ACTIVE) return publishedRender
         val measured = beltSurfaceSpeeds()
-        val dt = 1.0 / PhysicsLevel.TPS
+        // Called once per Bullet update, which may be shorter than 1/TPS.
+        val dt = level.stepSeconds.toDouble()
         val left = captureSide(TrackedSide.LEFT, measured.first, dt) ?: return publishedRender
         val right = captureSide(TrackedSide.RIGHT, measured.second, dt) ?: return publishedRender
         val snapshot = TrackedRenderState(
@@ -1402,7 +1621,47 @@ class TrackedVehicleRuntime(
                 suspension = suspension,
                 tension = tension,
                 spin = spin,
+                boneOffsetX = wheel.renderOffset.x,
+                boneOffsetY = wheel.renderOffset.y,
+                boneOffsetZ = wheel.renderOffset.z,
             )
+        }
+        // Physical belt pins, chassis frame. Each pin is shared by two links; the
+        // drawn point is the mean of both ends so a solver gap of a few
+        // millimetres is not shown as a hole.
+        val beltY = ArrayList<Double>()
+        val beltZ = ArrayList<Double>()
+        fun pinEnds(): List<Pair<Vector3f, Vector3f>>? {
+            val ends = ArrayList<Pair<Vector3f, Vector3f>>()
+            for ((runIndex, run) in compiled.physicalRuns.withIndex()) for ((linkIndex, link) in run.links.withIndex()) {
+                val body = debugRunBodies["${side.name}:$runIndex:$linkIndex"] ?: return null
+                val matrix = body.getPhysicsRotation(null).toRotationMatrix()
+                val location = body.getPhysicsLocation(null)
+                fun pin(local: Vec3) = inverse.mult(
+                    location.add(matrix.mult(Vector3f(local.x.toFloat(), local.y.toFloat(), local.z.toFloat()), Vector3f()))
+                        .subtract(origin),
+                    Vector3f(),
+                )
+                ends += pin(link.startPin) to pin(link.endPin)
+            }
+            return ends
+        }
+        val ends = if (compiled.chain != null) pinEnds() else null
+        belts[side]?.let { belt ->
+            // The envelope belt's centre line, resampled to a fixed count so the
+            // client can interpolate across a split or merge.
+            val loop = belt.loopWorld().map { inverse.mult(it.subtract(origin), Vector3f()) }
+            val (ys, zs) = TrackedDynamicBelt.resample(loop.map { it.y.toDouble() }, loop.map { it.z.toDouble() }, RENDER_LOOP_POINTS)
+            beltY += ys
+            beltZ += zs
+        }
+        if (ends != null) {
+            for (index in ends.indices) {
+                val previous = ends[(index - 1 + ends.size) % ends.size].second
+                val start = ends[index].first
+                beltY += ((previous.y + start.y) * 0.5).toDouble()
+                beltZ += ((previous.z + start.z) * 0.5).toDouble()
+            }
         }
         return TrackedSideRenderState(
             phase = renderPhase[ordinal],
@@ -1416,6 +1675,9 @@ class TrackedVehicleRuntime(
             seatNormal = template?.seatNormalM ?: 0.0,
             seatAngle = template?.seatAngleRad ?: 0.0,
             wheels = poses,
+            hiddenBones = template?.hiddenBones.orEmpty(),
+            beltY = beltY,
+            beltZ = beltZ,
         )
     }
 
@@ -1538,19 +1800,32 @@ class TrackedVehicleRuntime(
         val forwardZ: Double,
     )
     @Volatile private var publishedTerrainPose: TerrainPose? = null
-    /** Centres of the running gear, for ramp rejection. Not a collision shape. */
-    @Volatile private var publishedGearProbes: List<GearProbe> = emptyList()
     /** Hull parts used only to draw the installed chassis OBBs. */
     @Volatile private var debugCollisionParts: List<CollisionPart> = emptyList()
     @Volatile private var collisionDebug: TrackedCollisionDebug.Snapshot? = null
     private val collisionDebugEpoch = java.util.concurrent.atomic.AtomicLong(0)
 
-    fun gearProbes(): List<GearProbe> = publishedGearProbes
-
     fun collisionDebugSnapshot(): TrackedCollisionDebug.Snapshot? = collisionDebug
 
     internal fun setDebugCollisionParts(parts: List<CollisionPart>) {
         debugCollisionParts = parts
+    }
+
+    /** Articulated bodies (turret, barrel) and their parts in each body's own frame. */
+    @Volatile private var debugArticulation: () -> List<Pair<PhysicsRigidBody, List<CollisionPart>>> = { emptyList() }
+
+    /** Chassis body origin in the vehicle data frame; the client draws relative to it. */
+    @Volatile private var debugFrameOrigin: net.minecraft.world.phys.Vec3 = net.minecraft.world.phys.Vec3.ZERO
+
+    /** Live run bodies, keyed `SIDE:index`, for the debug view only. */
+    private val debugRunBodies = java.util.concurrent.ConcurrentHashMap<String, PhysicsRigidBody>()
+
+    internal fun setDebugFrame(
+        origin: net.minecraft.world.phys.Vec3,
+        articulation: () -> List<Pair<PhysicsRigidBody, List<CollisionPart>>>,
+    ) {
+        debugFrameOrigin = origin
+        debugArticulation = articulation
     }
 
     fun publishStepPose() {
@@ -1571,7 +1846,6 @@ class TrackedVehicleRuntime(
             flat.first,
             flat.second,
         )
-        publishGearProbes()
         if (TrackedTerrainDebugService.watchingAnyone()) publishCollisionDebug()
     }
 
@@ -1591,6 +1865,7 @@ class TrackedVehicleRuntime(
         anchorWorld: Vector3f,
     ) {
         if (!forceN.isFinite() || abs(forceN) < 1.0e-4f) return
+        val wakes = abs(forceN) >= WAKE_FORCE_N
         if (!upWorld.x.isFinite() || !upWorld.y.isFinite() || !upWorld.z.isFinite()) return
         if (!anchorWorld.x.isFinite() || !anchorWorld.y.isFinite() || !anchorWorld.z.isFinite()) return
         val up = Vector3f(upWorld)
@@ -1600,61 +1875,11 @@ class TrackedVehicleRuntime(
         val relative = Vector3f(anchorWorld).subtractLocal(hull.getPhysicsLocation(null))
         hull.applyForce(force, relative)
         wheel.applyCentralForce(force.mult(-1f, Vector3f()))
-        if (!hull.isActive) hull.activate(true)
-        if (!wheel.isActive) wheel.activate(true)
-    }
-
-    /** Physics thread. Replaces the published list; never mutates a list a builder already holds. */
-    private fun publishGearProbes() {
-        val probes = ArrayList<GearProbe>()
-        val (origin, rotation) = chassisPose()
-        val matrix = rotation.toRotationMatrix()
-        for (side in TrackedSide.entries) {
-            val compiled = spec.side(side)
-            val bodies = wheelBodies[side].orEmpty()
-            compiled.wheels.forEachIndexed { index, wheel ->
-                val body = bodies.getOrNull(index) ?: return@forEachIndexed
-                val location = body.getPhysicsLocation(null)
-                val bodyRotation = body.getPhysicsRotation(null)
-                val half = TrackedCollisionDebug.worldHalf(
-                    bodyRotation,
-                    Vector3f(wheel.halfWidth.toFloat(), wheel.radius.toFloat(), wheel.radius.toFloat()),
-                )
-                probes += GearProbe(
-                    location.x.toDouble(), location.y.toDouble(), location.z.toDouble(),
-                    half.x.toDouble(), half.y.toDouble(), half.z.toDouble(),
-                )
-            }
-            val runs = runtimes[side].orEmpty()
-            compiled.runs.forEachIndexed { index, run ->
-                val frame = runs.getOrNull(index)?.snapshot()?.links?.firstOrNull()?.takeIf { it.finite() }
-                val center: Vector3f
-                val bodyRotation: Quaternion
-                if (frame != null) {
-                    center = Vector3f(
-                        frame.position.x.toFloat(),
-                        frame.position.y.toFloat(),
-                        frame.position.z.toFloat(),
-                    )
-                    bodyRotation = Quaternion(frame.rotationX, frame.rotationY, frame.rotationZ, frame.rotationW)
-                } else {
-                    val local = Vector3f(run.center.x.toFloat(), run.center.y.toFloat(), run.center.z.toFloat())
-                    center = matrix.mult(local, Vector3f()).addLocal(origin)
-                    bodyRotation = Quaternion(rotation).mult(
-                        Quaternion(run.rotation.x, run.rotation.y, run.rotation.z, run.rotation.w),
-                    )
-                }
-                val half = TrackedCollisionDebug.worldHalf(
-                    bodyRotation,
-                    Vector3f(run.halfExtents.x.toFloat(), run.halfExtents.y.toFloat(), run.halfExtents.z.toFloat()),
-                )
-                probes += GearProbe(
-                    center.x.toDouble(), center.y.toDouble(), center.z.toDouble(),
-                    half.x.toDouble(), half.y.toDouble(), half.z.toDouble(),
-                )
-            }
+        // A near-zero residual must not keep a parked, sleeping vehicle awake.
+        if (wakes) {
+            if (!hull.isActive) hull.activate(true)
+            if (!wheel.isActive) wheel.activate(true)
         }
-        publishedGearProbes = probes
     }
 
     /**
@@ -1664,20 +1889,39 @@ class TrackedVehicleRuntime(
     private fun publishCollisionDebug() {
         val segments = ArrayList<Float>(256)
         val (origin, rotation) = chassisPose()
-        val matrix = rotation.toRotationMatrix()
+        val inverse = Quaternion(rotation).inverse()
+        val inverseMatrix = inverse.toRotationMatrix()
+        // Every pose below is read in this same call, so relative poses are
+        // consistent even though the absolute pose keeps moving.
+        fun toLocal(world: Vector3f): Vector3f = inverseMatrix.mult(world.subtract(origin), Vector3f())
+        fun toLocal(world: Quaternion): Quaternion = Quaternion(inverse).mult(world)
+
         for (part in debugCollisionParts) {
-            val local = Vector3f(part.center.x.toFloat(), part.center.y.toFloat(), part.center.z.toFloat())
-            val world = matrix.mult(local, Vector3f()).addLocal(origin)
-            val worldRotation = Quaternion(rotation).mult(
-                Quaternion(part.rotation.x, part.rotation.y, part.rotation.z, part.rotation.w),
-            )
             TrackedCollisionDebug.appendBox(
                 segments,
-                world,
-                worldRotation,
+                Vector3f(part.center.x.toFloat(), part.center.y.toFloat(), part.center.z.toFloat()),
+                Quaternion(part.rotation.x, part.rotation.y, part.rotation.z, part.rotation.w),
                 Vector3f(part.half.x.toFloat(), part.half.y.toFloat(), part.half.z.toFloat()),
                 TrackedCollisionDebug.KIND_HULL,
             )
+        }
+        for ((body, parts) in debugArticulation()) {
+            val bodyLocation = body.getPhysicsLocation(null)
+            val bodyRotation = body.getPhysicsRotation(null)
+            val bodyMatrix = bodyRotation.toRotationMatrix()
+            for (part in parts) {
+                val partCenter = Vector3f(part.center.x.toFloat(), part.center.y.toFloat(), part.center.z.toFloat())
+                val world = bodyMatrix.mult(partCenter, Vector3f()).addLocal(bodyLocation)
+                val worldRotation = Quaternion(bodyRotation)
+                    .mult(Quaternion(part.rotation.x, part.rotation.y, part.rotation.z, part.rotation.w))
+                TrackedCollisionDebug.appendBox(
+                    segments,
+                    toLocal(world),
+                    toLocal(worldRotation),
+                    Vector3f(part.half.x.toFloat(), part.half.y.toFloat(), part.half.z.toFloat()),
+                    TrackedCollisionDebug.KIND_ARTICULATION,
+                )
+            }
         }
         for (side in TrackedSide.entries) {
             val compiled = spec.side(side)
@@ -1686,46 +1930,79 @@ class TrackedVehicleRuntime(
                 val body = bodies.getOrNull(index) ?: return@forEachIndexed
                 TrackedCollisionDebug.appendCylinder(
                     segments,
-                    body.getPhysicsLocation(null),
-                    body.getPhysicsRotation(null),
+                    toLocal(body.getPhysicsLocation(null)),
+                    toLocal(body.getPhysicsRotation(null)),
                     wheel.halfWidth.toFloat(),
                     wheel.radius.toFloat(),
                     TrackedCollisionDebug.KIND_WHEEL,
                 )
             }
-            val runs = runtimes[side].orEmpty()
-            compiled.runs.forEachIndexed { index, run ->
-                val frame = runs.getOrNull(index)?.snapshot()?.links?.firstOrNull()?.takeIf { it.finite() }
-                val center: Vector3f
-                val bodyRotation: Quaternion
-                if (frame != null) {
-                    center = Vector3f(
-                        frame.position.x.toFloat(),
-                        frame.position.y.toFloat(),
-                        frame.position.z.toFloat(),
-                    )
-                    bodyRotation = Quaternion(frame.rotationX, frame.rotationY, frame.rotationZ, frame.rotationW)
-                } else {
-                    val local = Vector3f(run.center.x.toFloat(), run.center.y.toFloat(), run.center.z.toFloat())
-                    center = matrix.mult(local, Vector3f()).addLocal(origin)
-                    bodyRotation = Quaternion(rotation).mult(
-                        Quaternion(run.rotation.x, run.rotation.y, run.rotation.z, run.rotation.w),
+            belts[side]?.let { belt ->
+                for (piece in belt.pieces) {
+                    TrackedCollisionDebug.appendBox(
+                        segments,
+                        toLocal(piece.body.getPhysicsLocation(null)),
+                        toLocal(piece.body.getPhysicsRotation(null)),
+                        Vector3f((belt.belt.widthM * 0.5).toFloat(), (belt.belt.thicknessM * 0.5).toFloat(), (piece.lengthM * 0.5).toFloat()),
+                        TrackedCollisionDebug.KIND_RUN,
                     )
                 }
-                TrackedCollisionDebug.appendBox(
-                    segments,
-                    center,
-                    bodyRotation,
-                    Vector3f(run.halfExtents.x.toFloat(), run.halfExtents.y.toFloat(), run.halfExtents.z.toFloat()),
-                    TrackedCollisionDebug.KIND_RUN,
-                )
+                for ((wheelIndex, chords) in belt.belt.wraps) {
+                    val listIndex = compiled.wheels.indexOfFirst { it.index == wheelIndex }
+                    val body = bodies.getOrNull(listIndex) ?: continue
+                    val wheel = compiled.wheels[listIndex]
+                    val matrix = body.getPhysicsRotation(null).toRotationMatrix()
+                    val dx = (compiled.belt.centerPlaneX - wheel.assemblyCenter.x).toFloat()
+                    for (chord in chords) {
+                        val offset = matrix.mult(Vector3f(dx, chord.center.y.toFloat(), chord.center.z.toFloat()), Vector3f())
+                        val half = chord.pitchRad * 0.5
+                        val rotation = Quaternion(body.getPhysicsRotation(null)).mult(
+                            Quaternion(kotlin.math.sin(half).toFloat(), 0f, 0f, kotlin.math.cos(half).toFloat()),
+                        )
+                        TrackedCollisionDebug.appendBox(
+                            segments,
+                            toLocal(body.getPhysicsLocation(null).add(offset)),
+                            toLocal(rotation),
+                            Vector3f((belt.belt.widthM * 0.5).toFloat(), (belt.belt.thicknessM * 0.5).toFloat(), chord.halfLengthM.toFloat()),
+                            TrackedCollisionDebug.KIND_RUN,
+                        )
+                    }
+                }
+            }
+            val runs = runtimes[side].orEmpty()
+            compiled.physicalRuns.forEachIndexed { index, run ->
+                run.links.forEachIndexed { linkIndex, link ->
+                    // Read the live body, not the per-substep run snapshot, so the
+                    // pose belongs to the same instant as the chassis and wheels.
+                    val body = debugRunBodies["${side.name}:$index:$linkIndex"]?.takeIf { runs.getOrNull(index) != null }
+                    val center: Vector3f
+                    val bodyRotation: Quaternion
+                    if (body != null) {
+                        center = toLocal(body.getPhysicsLocation(null))
+                        bodyRotation = toLocal(body.getPhysicsRotation(null))
+                    } else {
+                        center = Vector3f(link.center.x.toFloat(), link.center.y.toFloat(), link.center.z.toFloat())
+                        bodyRotation = Quaternion(link.rotation.x, link.rotation.y, link.rotation.z, link.rotation.w)
+                    }
+                    TrackedCollisionDebug.appendBox(
+                        segments,
+                        center,
+                        bodyRotation,
+                        Vector3f(link.halfExtents.x.toFloat(), link.halfExtents.y.toFloat(), link.halfExtents.z.toFloat()),
+                        TrackedCollisionDebug.KIND_RUN,
+                    )
+                }
             }
         }
         val truncated = segments.size / TrackedCollisionDebug.FLOATS_PER_SEGMENT >= TrackedCollisionDebug.MAX_SEGMENTS
+        val frameOrigin = debugFrameOrigin
         collisionDebug = TrackedCollisionDebug.Snapshot(
             collisionDebugEpoch.incrementAndGet(),
             FloatArray(segments.size) { segments[it] },
             truncated,
+            frameOrigin.x.toFloat(),
+            frameOrigin.y.toFloat(),
+            frameOrigin.z.toFloat(),
         )
     }
 
@@ -1769,7 +2046,7 @@ class TrackedVehicleRuntime(
                 brake = command.brake,
                 powered = command.powered,
                 drivetrain = drivetrain,
-                dtSeconds = 1.0 / PhysicsLevel.TPS,
+                dtSeconds = level.stepSeconds.toDouble(),
                 actualLeftMps = sideSpeeds.first,
                 actualRightMps = sideSpeeds.second,
             )
@@ -1875,7 +2152,7 @@ class TrackedVehicleRuntime(
                 )
             }
         }
-        return StaticGearSample(samples, runtimes.values.sumOf { it.size })
+        return StaticGearSample(samples, runtimes.values.sumOf { it.size } + belts.values.sumOf { it.bodyCount })
     }
 
     /**
@@ -2013,8 +2290,8 @@ class TrackedVehicleRuntime(
             val window = lastSideContact(side)
             val craftSpeed = hullPointSpeed(point, Vector3f(measuring.x.toFloat(), measuring.y.toFloat(), measuring.z.toFloat()), runBody === bodyA)
             if (window.contactCount > 0 && TrackedDriveController.slipping(commanded, tangentSpeed, craftSpeed)) {
-                val loadN = window.normalImpulseNs * PhysicsLevel.TPS
-                val tractionN = window.tractionImpulseNs * PhysicsLevel.TPS
+                val loadN = window.normalImpulseNs / level.stepSeconds
+                val tractionN = window.tractionImpulseNs / level.stepSeconds
                 val grip = TrackedDriveController.tractionGripFraction(
                     tractionN = tractionN,
                     supportedN = loadN,
@@ -2376,6 +2653,7 @@ class TrackedVehicleRuntime(
                 // native read per substep.
                 publishStepPose()
                 beginSupportWindow()
+                scheduleSegmentation()
             }
         }
     }
@@ -2401,9 +2679,15 @@ class TrackedVehicleRuntime(
     private fun beltSurfaceSpeeds(): Pair<Double, Double> {
         val forward = TrackedVehicleFrame.worldForward(chassis.getPhysicsRotation(null).toRotationMatrix())
         fun sideSpeed(side: TrackedSide): Double {
-            val samples = runtimes[side].orEmpty().mapNotNull { runtime ->
-                runtime.linkVelocity(0)?.let { velocity ->
-                    velocity.x * forward.x + velocity.y * forward.y + velocity.z * forward.z
+            belts[side]?.let { belt ->
+                val velocity = belt.bottomVelocity()
+                return (velocity.x * forward.x + velocity.y * forward.y + velocity.z * forward.z).toDouble()
+            }
+            val samples = runtimes[side].orEmpty().flatMap { runtime ->
+                (0 until runtime.snapshot().links.size.coerceAtLeast(1)).mapNotNull { link ->
+                    runtime.linkVelocity(link)?.let { velocity ->
+                        velocity.x * forward.x + velocity.y * forward.y + velocity.z * forward.z
+                    }
                 }
             }
             return if (samples.isEmpty()) 0.0 else samples.average()
@@ -2637,6 +2921,12 @@ class TrackedVehicleRuntime(
     companion object {
         /** Ticks before a failed terrain region request may be retried. */
         private const val RETRY_BACKOFF_TICKS = 10L
+
+        /** A mount force below this does not wake a sleeping hull or wheel, newtons. */
+        private const val WAKE_FORCE_N = 1.0f
+
+        /** Points the envelope belt's centre line is resampled to for the client. */
+        private const val RENDER_LOOP_POINTS = 96
         private val NEXT_TERRAIN_REGION_ID = java.util.concurrent.atomic.AtomicLong()
 
         /**

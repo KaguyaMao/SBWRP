@@ -10,36 +10,31 @@ import net.minecraftforge.gametest.PrefixGameTestTemplate
  * template namespace, so `-PgameTestNamespaces=<namespace>` registers exactly
  * one original scenario in a fresh GameTest server/world.
  */
-@GameTestHolder("sbw_physics_isolated")
+@GameTestHolder("superbwarfare")
 @PrefixGameTestTemplate(false)
 object TrackedTerrainIsolatedGameTests {
     @JvmStatic
-    @GameTest(template = "empty", templateNamespace = "sbw_physics_forward_drive", timeoutTicks = 900)
+    @GameTest(template = "empty", templateNamespace = "superbwarfare_physics", batch = "focused-forward-drive", timeoutTicks = 900)
     fun forwardDrive(helper: GameTestHelper) =
         TrackedTerrainAndDriveGameTests.contactMotionDrivesTheHullForward(helper)
 
     @JvmStatic
-    @GameTest(template = "empty", templateNamespace = "sbw_physics_under_deck", timeoutTicks = 900)
-    fun underDeckDrive(helper: GameTestHelper) =
-        TrackedTerrainAndDriveGameTests.theBeltDrivesUnderABridgeDeck(helper)
+    @GameTest(template = "empty", templateNamespace = "superbwarfare_physics", batch = "focused-parked-creep", timeoutTicks = 2000)
+    fun parkedCreep(helper: GameTestHelper) =
+        TrackedTerrainAndDriveGameTests.aParkedVehicleDoesNotCreep(helper)
 
     @JvmStatic
-    @GameTest(template = "empty", templateNamespace = "sbw_physics_ramp_step", timeoutTicks = 1200)
-    fun rampStep(helper: GameTestHelper) =
-        TrackedTerrainAndDriveGameTests.aOneBlockStepClimbsOnTheBulletRamp(helper)
-
-    @JvmStatic
-    @GameTest(template = "empty", templateNamespace = "sbw_physics_right_steer", timeoutTicks = 900)
+    @GameTest(template = "empty", templateNamespace = "superbwarfare_physics", batch = "focused-right-steer", timeoutTicks = 900)
     fun rightSteer(helper: GameTestHelper) =
         TrackedTerrainAndDriveGameTests.steeringYawsTheHull(helper)
 
     @JvmStatic
-    @GameTest(template = "empty", templateNamespace = "sbw_physics_left_steer", timeoutTicks = 900)
+    @GameTest(template = "empty", templateNamespace = "superbwarfare_physics", batch = "focused-left-steer", timeoutTicks = 900)
     fun leftSteer(helper: GameTestHelper) =
         TrackedTerrainAndDriveGameTests.aLeftSteerYawsTheOtherWay(helper)
 
     @JvmStatic
-    @GameTest(template = "empty", templateNamespace = "sbw_physics_coast", timeoutTicks = 900)
-    fun coast(helper: GameTestHelper) =
-        TrackedTerrainAndDriveGameTests.coastRemovesTheConveyorTargetInsteadOfDriving(helper)
+    @GameTest(template = "empty", templateNamespace = "superbwarfare_physics", batch = "focused-flat-drive-stability", timeoutTicks = 1200)
+    fun flatDriveStability(helper: GameTestHelper) =
+        TrackedTerrainAndDriveGameTests.flatDriveKeepsSuspensionAndBeltTopologyStable(helper)
 }

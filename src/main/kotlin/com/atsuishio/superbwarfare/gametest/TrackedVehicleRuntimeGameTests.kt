@@ -117,8 +117,15 @@ object TrackedVehicleRuntimeGameTests {
                 val created = runtime.get() ?: error("runtime was not created")
                 helper.assertTrue(created.isCreated, "the runtime must report created")
                 val expectedWheels = left.wheels.size + right.wheels.size
-                val expectedRuns = left.runs.size + right.runs.size
-                val expectedEnds = (left.runs.size + right.runs.size) * 2
+                // The runtime assembles the physical belt (anchor chain or wheel-pair
+                // runs); count what it was compiled to build.
+                // An envelope belt starts with front, one bottom piece, rear and top:
+                // four bodies, four wheel joints, two span pins and one lock per road wheel.
+                fun runsOf(side: CompiledTrackSide) = side.envelope?.let { 4 } ?: side.physicalRuns.size
+                fun endsOf(side: CompiledTrackSide) =
+                    side.envelope?.let { 6 + it.roadFeet.size } ?: side.physicalRuns.sumOf { it.externals.size }
+                val expectedRuns = runsOf(left) + runsOf(right)
+                val expectedEnds = endsOf(left) + endsOf(right)
                 helper.assertTrue(
                     created.wheelCount == expectedWheels,
                     "expected $expectedWheels wheel bodies, got ${created.wheelCount}",

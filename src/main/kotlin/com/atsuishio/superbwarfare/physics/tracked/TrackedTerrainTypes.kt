@@ -86,24 +86,6 @@ data class CompiledTerrain(
     }
 }
 
-/**
- * One running-gear body, detached from Bullet, used only to refuse a ramp that
- * would be generated through that body.
- *
- * The probe is the body's centre and its world-aligned half extents. A wheel
- * resting on a slope is not a cut: the slope is near the bottom of the probe.
- * A slope through the inner band of the probe is an assist surface inserted
- * into the mechanism and must stay a wall instead.
- */
-data class GearProbe(
-    val x: Double,
-    val y: Double,
-    val z: Double,
-    val halfX: Double,
-    val halfY: Double,
-    val halfZ: Double,
-)
-
 /** One detached Minecraft collision box in world coordinates. */
 data class TerrainBox(
     val minX: Double,
@@ -197,6 +179,23 @@ data class TerrainEnvelope(
                 for (run in compiled.runs) {
                     includeRun(run)
                 }
+                // The assembled belt may differ from the wheel-pair runs (anchor
+                // chain, thickened units); the window must cover what is built.
+                for (run in compiled.physicalRuns) for (link in run.links) {
+                    val rotation = link.rotation.toQuaternion()
+                    val xAxis = rotation.transform(org.joml.Vector3f(1f, 0f, 0f))
+                    val yAxis = rotation.transform(org.joml.Vector3f(0f, 1f, 0f))
+                    val zAxis = rotation.transform(org.joml.Vector3f(0f, 0f, 1f))
+                    val half = link.halfExtents
+                    include(
+                        link.center,
+                        Vec3(
+                            abs(xAxis.x) * half.x + abs(yAxis.x) * half.y + abs(zAxis.x) * half.z,
+                            abs(xAxis.y) * half.x + abs(yAxis.y) * half.y + abs(zAxis.y) * half.z,
+                            abs(xAxis.z) * half.x + abs(yAxis.z) * half.y + abs(zAxis.z) * half.z,
+                        ),
+                    )
+                }
             }
             return TerrainEnvelope(minX, maxX, minY, maxY, minZ, maxZ)
         }
@@ -258,10 +257,12 @@ data class RampGate(
             else -> 0.0
         }
         val alignment = climbX * forwardX + climbZ * forwardZ
-        // `<=` rejects the perpendicular world axis at a 30 degree heading,
-        // where its alignment is exactly 0.5. The longitudinal axis is then
-        // at least cos(15 deg) and still passes.
-        if (abs(alignment) <= minAlignment) return false
+        // A rise whose climb is within 60 degrees of the nose or the tail ramps;
+        // exactly 60 degrees is included. With 30 degree buckets this means a
+        // heading near a world axis ramps only that axis, and any oblique heading
+        // ramps both, so an angled approach meets a slope instead of a wall.
+        // A rise at 90 degrees (beside the hull) always stays a wall.
+        if (abs(alignment) < minAlignment - 1.0e-6) return false
         val faceX = if (climbX != 0.0) face else lateralCell + 0.5
         val faceZ = if (climbZ != 0.0) face else lateralCell + 0.5
         val offsetX = faceX - originX
@@ -287,6 +288,27 @@ data class RampGate(
             return cos(angle) to sin(angle)
         }
 
+        /**
+         * Extra degrees a heading must pass a bucket boundary before the bucket
+         * changes. Without it a vehicle driving near 15 degrees off an axis would
+         * swap between "one axis" and "both axes" and rebuild every few ticks.
+         */
+        const val HYSTERESIS_DEGREES = 7.5
+
+        /**
+         * Bucket for a heading, keeping [previous] while the heading stays within
+         * half a bucket plus [HYSTERESIS_DEGREES] of it.
+         */
+        fun bucketWithHysteresis(forwardX: Double, forwardZ: Double, previous: Int?): Int {
+            val fresh = bucketOf(forwardX, forwardZ)
+            if (previous == null || previous !in 0 until BUCKET_COUNT || previous == fresh) return fresh
+            if (hypot(forwardX, forwardZ) < 1.0e-8) return previous
+            val (px, pz) = forwardOf(previous)
+            val cosine = ((forwardX * px + forwardZ * pz) / hypot(forwardX, forwardZ)).coerceIn(-1.0, 1.0)
+            val limit = Math.toRadians(15.0 + HYSTERESIS_DEGREES)
+            return if (kotlin.math.acos(cosine) <= limit) previous else fresh
+        }
+
         /** Snap heading to a 30 degree bucket so a small yaw reuses the mesh. */
         fun forVehicle(
             originX: Double,
@@ -294,8 +316,9 @@ data class RampGate(
             forwardX: Double,
             forwardZ: Double,
             lateralHalfWidthM: Double,
+            previousBucket: Int? = null,
         ): RampGate {
-            val (fx, fz) = forwardOf(bucketOf(forwardX, forwardZ))
+            val (fx, fz) = forwardOf(bucketWithHysteresis(forwardX, forwardZ, previousBucket))
             return RampGate(originX, originZ, fx, fz, lateralHalfWidthM)
         }
     }
@@ -342,6 +365,8 @@ class TerrainMeshPlan(
      * using the same index order as [indices].
      */
     val rampTriangles: BooleanArray = BooleanArray(indices.size / 3),
+    /** Corner cones joining perpendicular ramps; included in [rampTriangles]. */
+    val cornerPatchCount: Int = 0,
 ) {
     val isEmpty: Boolean get() = indices.isEmpty()
 

@@ -142,6 +142,11 @@ data class CompiledWheel(
     val tensioner: CompiledTensioner? = null,
     /** Which side of this wheel the belt wraps around. */
     val wrap: TrackWrap = TrackWrap.OUTSIDE,
+    /**
+     * Bone pivot minus [assemblyCenter], metres. Zero unless the side aligns
+     * wheels to the belt plane; the renderer adds it so the bone keeps its pose.
+     */
+    val renderOffset: Vec3 = Vec3.ZERO,
 ) {
     val isSuspended: Boolean get() = role == TrackWheelRole.SUPPORT
     val receivesDrive: Boolean get() = role == TrackWheelRole.DRIVE_GUIDE
@@ -376,6 +381,81 @@ data class LegacyShoeChainAudit(
     val linkMassTotalKg: Double get() = linkMassKg * loop.linkCount
 }
 
+/**
+ * One dynamic body of the physical belt, chassis frame.
+ *
+ * [center] is the body origin; for a thickened bottom unit it sits inward of the
+ * belt centre line, and every pivot carries that offset.
+ */
+data class CompiledPhysicalLink(
+    val center: Vec3,
+    val rotation: CompiledRotation,
+    val halfExtents: Vec3,
+    val massKg: Double,
+    /** Belt centre-line pins in this link's body frame; shared with the neighbours. */
+    val startPin: Vec3 = Vec3(0.0, 0.0, -halfExtents.z),
+    val endPin: Vec3 = Vec3(0.0, 0.0, halfExtents.z),
+)
+
+/** Hinge between two links of one physical run; frames are in each link's body frame. */
+data class CompiledPhysicalHinge(
+    val previous: Int,
+    val next: Int,
+    val pivotInPrevious: Vec3,
+    val pivotInNext: Vec3,
+    val frameInPrevious: CompiledRotation,
+    val frameInNext: CompiledRotation,
+    val halfAngleRad: Double,
+)
+
+/** Joint between link [link] of a physical run and a wheel. [plan] uses a RUN ref for the link. */
+data class CompiledExternalJoint(
+    val link: Int,
+    val plan: CompiledJointPlan,
+)
+
+/**
+ * One core `TrackRun`: a serial chain of links, its internal hinges and the joints
+ * that tie it to wheels. Both belt topologies compile to this one shape, so the
+ * runtime has a single assembly path.
+ */
+data class CompiledPhysicalRun(
+    val index: Int,
+    val label: String,
+    val links: List<CompiledPhysicalLink>,
+    val hinges: List<CompiledPhysicalHinge>,
+    val externals: List<CompiledExternalJoint>,
+    /** Multiplier on link rotational inertia; 1 keeps the box's own inertia. */
+    val inertiaScale: Double = 1.0,
+) {
+    val massKg: Double get() = links.sumOf { it.massKg }
+}
+
+/** One solid chassis box in the chassis frame (origin = [TrackedVehicleSpec.chassisOriginX]..). */
+data class CompiledHullBox(
+    val center: Vec3,
+    val halfExtents: Vec3,
+    val rotation: CompiledRotation = CompiledRotation.IDENTITY,
+)
+
+/**
+ * One belt envelope reference point.
+ *
+ * [bindPoint] is on the belt centre line in the chassis frame. The anchor moves
+ * with [ownerWheel]: its live position is the owner's centre plus [offset].
+ * [pathDistance] is the anchor's distance along the rest wheel envelope, which
+ * fixes the anchor order around the loop.
+ */
+data class CompiledEnvelopeAnchor(
+    val ordinal: Int,
+    val bindPoint: Vec3,
+    val ownerWheel: Int,
+    val offset: Vec3,
+    val pathDistance: Double,
+    /** Signed distance from the owner's belt centre-line circle, metres. */
+    val radialErrorM: Double,
+)
+
 /** One side's compiled mechanism. Immutable; every list is defensively copied. */
 class CompiledTrackSide(
     val side: TrackedSide,
@@ -394,7 +474,27 @@ class CompiledTrackSide(
     val suspension: SuspensionAudit,
     /** Historical 79-shoe audit; present only when that chain also compiled. */
     val legacy: LegacyShoeChainAudit? = null,
+    /** Belt envelope reference points in belt traversal order; empty when none are authored. */
+    anchors: List<CompiledEnvelopeAnchor> = emptyList(),
+    /** The physical belt actually assembled; null means the wheel-pair runs. */
+    physicalRuns: List<CompiledPhysicalRun>? = null,
+    /** The anchor chain these physical runs were built from, when that topology is used. */
+    val chain: CompiledBeltChain? = null,
+    /** The wheel-fitted envelope belt; when present the runtime builds no core TrackRuns. */
+    val envelope: CompiledEnvelopeBelt? = null,
 ) {
+    val anchors: List<CompiledEnvelopeAnchor> = anchors.toList()
+
+    /** Bodies the runtime creates for the belt. The wheel-pair runs map one-to-one. */
+    val physicalRuns: List<CompiledPhysicalRun> = physicalRuns?.toList() ?: runs.map { run ->
+        CompiledPhysicalRun(
+            index = run.index,
+            label = "run_${run.index}",
+            links = listOf(CompiledPhysicalLink(run.center, run.rotation, run.halfExtents, run.massKg)),
+            hinges = emptyList(),
+            externals = run.attachments.map { CompiledExternalJoint(0, it.joint) },
+        )
+    }
     val wheels: List<CompiledWheel> = wheels.toList()
     val beltOrder: List<Int> = beltOrder.toList()
     val members: List<CompiledBeltMember> = members.toList()
@@ -552,6 +652,8 @@ data class TrackedRenderTemplate(
     val seatAlongM: Double = 0.0,
     val seatNormalM: Double = 0.0,
     val seatAngleRad: Double = 0.0,
+    /** Marker bones that exist only for compilation and must never be drawn. */
+    val hiddenBones: List<String> = emptyList(),
 )
 
 /**
@@ -581,13 +683,26 @@ class TrackedVehicleSpec(
     audit: List<TrackedAuditFinding>,
     renders: Map<TrackedSide, TrackedRenderTemplate>,
     val mass: TrackedMassAudit,
+    /** Physics-only chassis boxes; empty means "derive from the vehicle OBBs". */
+    hullBoxes: List<CompiledHullBox> = emptyList(),
+    /** Bullet updates per physics substep this vehicle asks the level for. */
+    val solverSubsteps: Int = 1,
+    /** Solver iterations per Bullet update this vehicle asks the level for; 10 is Bullet's default. */
+    val solverIterations: Int = 10,
 ) {
+    val hullBoxes: List<CompiledHullBox> = hullBoxes.toList()
     val sides: Map<TrackedSide, CompiledTrackSide> = Collections.unmodifiableMap(LinkedHashMap(sides))
     val audit: List<TrackedAuditFinding> = audit.toList()
     val renders: Map<TrackedSide, TrackedRenderTemplate> = Collections.unmodifiableMap(LinkedHashMap(renders))
 
     fun side(side: TrackedSide): CompiledTrackSide =
         sides[side] ?: throw TrackedGeometryException("side $side was not compiled")
+
+    /** Total number of physical belt runs (core TrackRuns), both sides. */
+    val totalPhysicalRunCount: Int get() = sides.values.sumOf { it.physicalRuns.size }
+
+    /** Total number of physical belt bodies, both sides. */
+    val totalPhysicalLinkCount: Int get() = sides.values.sumOf { side -> side.physicalRuns.sumOf { it.links.size } }
 
     /** Total number of physically simulated runs, both sides. */
     val totalRunCount: Int get() = sides.values.sumOf { it.runs.size }

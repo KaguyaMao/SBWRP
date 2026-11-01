@@ -26,6 +26,10 @@ data class TrackedWheelRenderPose(
     val tension: Double = 0.0,
     /** Continuous wheel rotation, radians. Not derived from the wrapped belt phase. */
     val spin: Double = 0.0,
+    /** Bone pivot minus body centre, metres; added only when placing the bone. */
+    val boneOffsetX: Double = 0.0,
+    val boneOffsetY: Double = 0.0,
+    val boneOffsetZ: Double = 0.0,
 ) {
     fun finite(): Boolean = listOf(x, y, z, radius, suspension, tension, spin).all(Double::isFinite) &&
         (!suspended || suspension.isFinite())
@@ -44,6 +48,14 @@ data class TrackedSideRenderState(
     val seatNormal: Double = 0.0,
     val seatAngle: Double = 0.0,
     val wheels: List<TrackedWheelRenderPose> = emptyList(),
+    /** Compile-only marker bones; the renderer keeps them invisible. */
+    val hiddenBones: List<String> = emptyList(),
+    /**
+     * Physical belt pins, chassis Y and Z, in loop order. Empty for the wheel-pair
+     * topology; when present the visible plates follow this polyline.
+     */
+    val beltY: List<Double> = emptyList(),
+    val beltZ: List<Double> = emptyList(),
 ) {
     fun finite(): Boolean = phase.isFinite() && beltSpeed.isFinite() && planeX.isFinite() &&
         restPitch.isFinite() && thickness.isFinite() && seatAlong.isFinite() &&
@@ -102,6 +114,8 @@ data class TrackedRenderState(
             phase = wrapLerp(phase, target.phase, alpha, target.visibleCount.toDouble()),
             beltSpeed = lerp(beltSpeed, target.beltSpeed, alpha),
             planeX = lerp(planeX, target.planeX, alpha),
+            beltY = if (beltY.size == target.beltY.size) beltY.indices.map { lerp(beltY[it], target.beltY[it], alpha) } else target.beltY,
+            beltZ = if (beltZ.size == target.beltZ.size) beltZ.indices.map { lerp(beltZ[it], target.beltZ[it], alpha) } else target.beltZ,
             wheels = target.wheels.map { next ->
                 val old = previous[next.index] ?: return@map next
                 next.copy(

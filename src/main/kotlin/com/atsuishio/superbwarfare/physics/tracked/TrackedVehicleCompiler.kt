@@ -42,6 +42,7 @@ private data class DraftWheel(
     val radius: Double,
     val width: Double,
     val tensioner: CompiledTensioner?,
+    val renderOffset: Vec3 = Vec3.ZERO,
 )
 
 object TrackedVehicleCompiler {
@@ -89,6 +90,35 @@ object TrackedVehicleCompiler {
                 ::info,
             )
             if (template != null) renders[side] = template
+        }
+
+        val hullBoxes = definition.hullCollision.mapIndexedNotNull { index, box ->
+            val half = box.size
+            if (!(half.x > 0.0 && half.y > 0.0 && half.z > 0.0) ||
+                !half.x.isFinite() || !half.y.isFinite() || !half.z.isFinite()
+            ) {
+                error("hull.size", "HullCollision[$index] needs finite positive half extents, was $half")
+                return@mapIndexedNotNull null
+            }
+            val origin = definition.chassisOrigin
+            CompiledHullBox(
+                center = Vec3(box.position.x - origin.x, box.position.y - origin.y, box.position.z - origin.z),
+                halfExtents = half,
+                rotation = org.joml.Quaternionf()
+                    .rotateY(Math.toRadians(box.rotation.y).toFloat())
+                    .rotateX(Math.toRadians(box.rotation.x).toFloat())
+                    .rotateZ(Math.toRadians(box.rotation.z).toFloat())
+                    .let { CompiledRotation(it.x, it.y, it.z, it.w) },
+            )
+        }
+        if (hullBoxes.isNotEmpty() && sides.size == TrackedSide.entries.size) {
+            for (overlap in TrackedHullAudit.audit(hullBoxes, sides.values)) {
+                error(
+                    "hull.running-gear",
+                    "HullCollision[${overlap.hullIndex}] overlaps ${overlap.member} by " +
+                        "${"%.1f".format(overlap.depthM * 1000.0)} mm; the hull must leave the running gear free",
+                )
+            }
         }
 
         val totalStationMass = sides.values.flatMap { it.wheels }.filter { it.isSuspended }
@@ -209,6 +239,16 @@ object TrackedVehicleCompiler {
             audit = findings.toList(),
             renders = renders,
             mass = mass,
+            hullBoxes = hullBoxes,
+            solverSubsteps = when (definition.track.topology) {
+                TrackTopology.ANCHOR_CHAIN -> definition.track.chain.solverSubsteps.coerceIn(1, 8)
+                TrackTopology.ENVELOPE_BELT -> definition.track.envelope.solverSubsteps.coerceIn(1, 8)
+                TrackTopology.WHEEL_PAIR_RUNS -> 1
+            },
+            solverIterations = when (definition.track.topology) {
+                TrackTopology.ENVELOPE_BELT -> definition.track.envelope.solverIterations.coerceIn(10, 200)
+                else -> 10
+            },
         )
 
         // The compiled result must be usable, not merely plausible. A spec the
@@ -234,7 +274,18 @@ object TrackedVehicleCompiler {
         val label = side.name
         if (sideDefinition.wheels.isEmpty()) return null
 
-        val resolved = resolveWheels(sideDefinition, definition, geometry, label, error, warn) ?: return null
+        val alignX = if (sideDefinition.alignWheelsToBelt) {
+            val template = sideDefinition.linkTemplateBone
+            if (template.isBlank() || template !in geometry.bones) {
+                error("$label.template.missing", "AlignWheelsToBelt needs link template bone $template")
+                return null
+            }
+            geometry.toPhysicsLocal(geometry.worldPivot(template), definition.renderScale).x -
+                definition.chassisOrigin.x
+        } else {
+            null
+        }
+        val resolved = resolveWheels(sideDefinition, definition, geometry, label, error, warn, alignX) ?: return null
         if (resolved.isEmpty()) return null
 
         // Stable wheel table order: longitudinal, so an index does not depend on
@@ -284,6 +335,7 @@ object TrackedVehicleCompiler {
                 suspension = suspension,
                 tensioner = wheel.tensioner,
                 wrap = wheel.definition.wrap ?: TrackWrap.OUTSIDE,
+                renderOffset = wheel.renderOffset,
             )
         }
 
@@ -381,6 +433,10 @@ object TrackedVehicleCompiler {
 
         val mounts = compileMounts(compiledWheels, suspension, belt, label, error) ?: return null
 
+        val anchors = compileAnchors(
+            sideDefinition, definition, geometry, compiledWheels, beltOrder, belt, label, error, info,
+        ) ?: return null
+
         val legacy = LegacyShoeChainCompiler.compile(
             side = side,
             sideDefinition = sideDefinition,
@@ -390,6 +446,69 @@ object TrackedVehicleCompiler {
             warn = warn,
             info = info,
         )
+
+        var chain: CompiledBeltChain? = null
+        var physicalRuns: List<CompiledPhysicalRun>? = null
+        if (definition.track.topology == TrackTopology.ANCHOR_CHAIN) {
+            if (anchors.size != 6) {
+                error("$label.chain.anchors", "$label AnchorChain needs six envelope anchors, has ${anchors.size}")
+                return null
+            }
+            val policy = definition.track.chain
+            val probe = CompiledTrackSide(side, compiledWheels, belt, beltOrder, members, runs, mounts, suspension, null, anchors)
+            try {
+                val built = TrackedBeltChainCompiler.compile(
+                    probe,
+                    definition.track.pitch,
+                    BeltChainPolicy(policy.unitPitches, policy.maxBendDegrees, policy.topPieces),
+                    massBudgetKg = runs.sumOf { it.massKg },
+                )
+                chain = built
+                physicalRuns = TrackedBeltChainPhysics.compile(
+                    probe, built, policy.bottomCollisionThickness, policy.unitInertiaScale,
+                )
+            } catch (failure: IllegalArgumentException) {
+                error("$label.chain", "$label cannot build the anchor chain: ${failure.message}")
+                return null
+            }
+            info(
+                "$label.chain",
+                "$label anchor chain: ${chain!!.segments.size} pieces, ${chain.bottomUnits} bottom units of " +
+                    "${"%.3f".format(chain.bottomUnitLengthM)} m, rest length ${"%.3f".format(chain.restLengthM)} m, " +
+                    "${physicalRuns.size} core runs",
+            )
+        }
+
+        var envelope: CompiledEnvelopeBelt? = null
+        if (definition.track.topology == TrackTopology.ENVELOPE_BELT) {
+            val probe = CompiledTrackSide(side, compiledWheels, belt, beltOrder, members, runs, mounts, suspension, null, anchors)
+            try {
+                envelope = TrackedEnvelopeBeltCompiler.compile(
+                    probe,
+                    definition.track.envelope,
+                    definition.track.pitch,
+                    massBudgetKg = runs.sumOf { it.massKg },
+                )
+            } catch (failure: IllegalArgumentException) {
+                error("$label.envelope", "$label cannot build the envelope belt: ${failure.message}")
+                return null
+            }
+            // The belt no longer needs core runs; the dynamic belt owns its bodies.
+            physicalRuns = emptyList()
+            val worst = envelope.anchorDeviationsM.maxOrNull() ?: 0.0
+            if (worst > 0.05) {
+                warn(
+                    "$label.envelope.anchors",
+                    "$label envelope anchors stand up to ${"%.1f".format(worst * 1000)} mm off the wheel-fitted belt",
+                )
+            }
+            info(
+                "$label.envelope",
+                "$label envelope belt: rest length ${"%.3f".format(envelope.restLengthM)} m, free spans " +
+                    "${"%.3f".format(envelope.freeLengthM)} m, bottom ${"%.3f".format(envelope.bottom.lengthM)} m, " +
+                    "anchor deviation <= ${"%.1f".format(worst * 1000)} mm",
+            )
+        }
 
         info(
             "$label.runs.summary",
@@ -414,7 +533,83 @@ object TrackedVehicleCompiler {
             mounts = mounts,
             suspension = suspension,
             legacy = legacy,
+            anchors = anchors,
+            physicalRuns = physicalRuns,
+            chain = chain,
+            envelope = envelope,
         )
+    }
+
+    /**
+     * Read the belt envelope reference points from [TrackSideDefinition.envelopeAnchorBone].
+     *
+     * Every cube centre of that bone is one anchor. Only its height and
+     * longitudinal position are used; the lateral coordinate is the belt plane,
+     * because the marker cubes are not authored symmetrically. Each anchor is
+     * owned by the wheel whose belt centre-line circle is nearest, and is ordered
+     * by its distance along the rest wheel envelope.
+     *
+     * Returns an empty list when no bone is authored and null on an error.
+     */
+    private fun compileAnchors(
+        sideDefinition: TrackSideDefinition,
+        definition: TrackedVehicleDefinition,
+        geometry: BedrockModelGeometry,
+        wheels: List<CompiledWheel>,
+        beltOrder: List<Int>,
+        belt: CompiledBeltGeometry,
+        label: String,
+        error: (String, String) -> Unit,
+        info: (String, String) -> Unit,
+    ): List<CompiledEnvelopeAnchor>? {
+        val boneName = sideDefinition.envelopeAnchorBone?.takeIf { it.isNotBlank() } ?: return emptyList()
+        val bone = geometry.bones[boneName]
+        if (bone == null || bone.cubes.isEmpty()) {
+            error("$label.anchors.missing", "envelope anchor bone $boneName is missing or has no cubes")
+            return null
+        }
+        val transform = geometry.localTransform(boneName)
+        val origin = definition.chassisOrigin
+        val half = belt.thicknessM * 0.5
+        val byIndex = wheels.associateBy { it.index }
+        val path = McspTrackPath.solve(
+            beltOrder.mapNotNull { byIndex[it] }.map {
+                McspTrackPath.Wheel(it.bindCenter.y, it.bindCenter.z, it.radius, it.wrap == TrackWrap.OUTSIDE)
+            },
+            belt.thicknessM,
+        )
+        if (path == null) {
+            error("$label.anchors.envelope", "$label rest wheel envelope does not close; anchors cannot be ordered")
+            return null
+        }
+        val raw = bone.cubes.map { cube ->
+            val model = transform.transformPosition(geometry.localCubeCentre(cube), Vector3d())
+            val local = geometry.toPhysicsLocal(model, definition.renderScale)
+            Vec3(belt.centerPlaneX, local.y - origin.y, local.z - origin.z)
+        }
+        val anchors = raw.map { point ->
+            val owner = wheels.minByOrNull { wheel ->
+                abs(hypot(point.y - wheel.bindCenter.y, point.z - wheel.bindCenter.z) - (wheel.radius + half))
+            } ?: return null
+            val radial = hypot(point.y - owner.bindCenter.y, point.z - owner.bindCenter.z) - (owner.radius + half)
+            val distance = com.atsuishio.superbwarfare.physics.tracked.render.BeltContactBaseline
+                .nearest(path, point.y, point.z)?.distance ?: 0.0
+            CompiledEnvelopeAnchor(
+                ordinal = 0,
+                bindPoint = point,
+                ownerWheel = owner.index,
+                offset = point.subtract(owner.bindCenter),
+                pathDistance = distance,
+                radialErrorM = radial,
+            )
+        }.sortedBy { it.pathDistance }.mapIndexed { index, anchor -> anchor.copy(ordinal = index) }
+        info(
+            "$label.anchors",
+            "$label ${anchors.size} envelope anchors from $boneName; owners " +
+                anchors.joinToString { byIndex[it.ownerWheel]?.bone ?: "?" } +
+                "; radial error ${anchors.joinToString { "%+.3f".format(it.radialErrorM) }} m",
+        )
+        return anchors
     }
 
     /**
@@ -429,6 +624,7 @@ object TrackedVehicleCompiler {
         label: String,
         error: (String, String) -> Unit,
         warn: (String, String) -> Unit,
+        alignX: Double? = null,
     ): List<DraftWheel>? {
         val resolved = ArrayList<DraftWheel>(sideDefinition.wheels.size)
         for (wheel in sideDefinition.wheels) {
@@ -438,7 +634,8 @@ object TrackedVehicleCompiler {
             }
             val rawPivot = geometry.toPhysicsLocal(geometry.worldPivot(wheel.bone), definition.renderScale)
             val origin = definition.chassisOrigin
-            val bind = Vec3(rawPivot.x - origin.x, rawPivot.y - origin.y, rawPivot.z - origin.z)
+            val pivot = Vec3(rawPivot.x - origin.x, rawPivot.y - origin.y, rawPivot.z - origin.z)
+            val bind = if (alignX != null) Vec3(alignX, pivot.y, pivot.z) else pivot
 
             // Cross-check the authored radius against the mesh so a renamed or
             // re-scaled bone cannot silently leave a wheel the wrong size. The
@@ -470,6 +667,7 @@ object TrackedVehicleCompiler {
                         axis = it.axis.normalize(),
                     )
                 },
+                renderOffset = pivot.subtract(bind),
             )
             if (wheel.role == TrackWheelRole.RETURN_ROLLER) {
                 warn(
@@ -858,6 +1056,7 @@ object TrackedVehicleCompiler {
             seatAlongM = envelope?.seat?.along ?: 0.0,
             seatNormalM = envelope?.seat?.normal ?: 0.0,
             seatAngleRad = envelope?.seat?.angle ?: 0.0,
+            hiddenBones = listOfNotNull(sideDefinition.envelopeAnchorBone?.takeIf { it.isNotBlank() }),
         )
     }
 
@@ -896,9 +1095,13 @@ object TrackedVehicleCompiler {
             warn("${compiled.side.name}.render.envelope", "${compiled.side.name} visible belt does not close at rest")
             return null
         }
-        val count = McspTrackPath.visibleCount(path.length, visiblePitch)
+        // With a physical belt (envelope or anchor chain) the visible belt is that
+        // belt, so its rest length fixes the plate count; the bind-pose wheel
+        // envelope only seats the template.
+        val restLength = compiled.envelope?.restLengthM ?: compiled.chain?.restLengthM ?: path.length
+        val count = McspTrackPath.visibleCount(restLength, visiblePitch)
         if (count <= 0) return null
-        val restPitch = path.length / count
+        val restPitch = restLength / count
         val pivot = geometry.toPhysicsLocal(geometry.worldPivot(templateBone), definition.renderScale)
         val origin = definition.chassisOrigin
         val forward = templateForward(geometry, templateBone)

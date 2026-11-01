@@ -90,19 +90,17 @@ object TrackedTerrainMeshPlanner {
          * ungated geometry used by shape tests.
          */
         rampGate: RampGate? = null,
-        /**
-         * Running-gear centres captured for this build. A ramp whose surface
-         * passes through the inner band of a probe is dropped and the riser
-         * stays a wall. Empty means "no occupancy known", which is the shape
-         * tests' path and must not invent a rejection.
-         */
-        gear: List<GearProbe> = emptyList(),
     ): TerrainMeshPlan {
+        // Ramps depend only on terrain, policy and heading. Never on where the
+        // running gear happens to be: a ramp that disappears while a wheel is on
+        // it turns its riser back into a wall inside the mechanism.
+        val index = BoxIndex(boxes)
         val ramps = if (terrain.rampsEnabled) {
-            planRamps(boxes, terrain, rampGate).filter { !rampCutsGear(it, gear) }
+            planRamps(index, terrain, rampGate)
         } else {
             emptyList()
         }
+        val corners = if (terrain.rampsEnabled) planCorners(index, ramps) else emptyList()
         val vertices = ArrayList<Float>(boxes.size * 72)
         val indices = ArrayList<Int>(boxes.size * 36)
         var wallQuads = 0
@@ -143,39 +141,33 @@ object TrackedTerrainMeshPlanner {
         // equality is not enough: a slab on a block, or a one-block step beside a
         // two-block wall, leaves a face buried in solid geometry that Bullet would
         // otherwise collide with.
-        val tops = HashMap<Long, MutableList<BoxRect>>()
-        val bottoms = HashMap<Long, MutableList<BoxRect>>()
-        val verticalX = HashMap<Long, MutableList<BoxSide>>()
-        val verticalZ = HashMap<Long, MutableList<BoxSide>>()
+        val tops = PlaneGrid()
+        val bottoms = PlaneGrid()
+        val verticalX = PlaneGrid()
+        val verticalZ = PlaneGrid()
 
         boxes.forEachIndexed { owner, box ->
             if (box.maxX - box.minX <= HEIGHT_EPS || box.maxY - box.minY <= HEIGHT_EPS ||
                 box.maxZ - box.minZ <= HEIGHT_EPS
             ) return@forEachIndexed
-            val rect = BoxRect(owner, box.minX, box.maxX, box.minZ, box.maxZ)
-            tops.getOrPut(q(box.maxY)) { ArrayList() }.add(rect)
-            bottoms.getOrPut(q(box.minY)) { ArrayList() }.add(rect)
-            verticalX.getOrPut(q(box.minX)) { ArrayList() }
-                .add(BoxSide(owner, box.minZ, box.maxZ, box.minY, box.maxY, -1))
-            verticalX.getOrPut(q(box.maxX)) { ArrayList() }
-                .add(BoxSide(owner, box.minZ, box.maxZ, box.minY, box.maxY, 1))
-            verticalZ.getOrPut(q(box.minZ)) { ArrayList() }
-                .add(BoxSide(owner, box.minX, box.maxX, box.minY, box.maxY, -1))
-            verticalZ.getOrPut(q(box.maxZ)) { ArrayList() }
-                .add(BoxSide(owner, box.minX, box.maxX, box.minY, box.maxY, 1))
+            val footprint = Rect2(box.minX, box.maxX, box.minZ, box.maxZ, owner)
+            tops.add(q(box.maxY), footprint, 0)
+            bottoms.add(q(box.minY), footprint, 0)
+            verticalX.add(q(box.minX), Rect2(box.minZ, box.maxZ, box.minY, box.maxY, owner), -1)
+            verticalX.add(q(box.maxX), Rect2(box.minZ, box.maxZ, box.minY, box.maxY, owner), 1)
+            verticalZ.add(q(box.minZ), Rect2(box.minX, box.maxX, box.minY, box.maxY, owner), -1)
+            verticalZ.add(q(box.maxZ), Rect2(box.minX, box.maxX, box.minY, box.maxY, owner), 1)
         }
 
-        fun visibleRects(face: Rect2, covers: List<Rect2>?, owner: Int): List<Rect2> =
-            uncoveredRectangles(face, covers.orEmpty().filter { it.owner != owner })
+        fun visibleRects(face: Rect2, covers: List<Rect2>, owner: Int): List<Rect2> =
+            uncoveredRectangles(face, covers.filter { it.owner != owner })
 
-        fun horizontalRects(index: Map<Long, List<BoxRect>>, plane: Long): List<Rect2> =
-            index[plane].orEmpty().map { Rect2(it.minA, it.maxA, it.minB, it.maxB, it.owner) }
+        /** Coplanar horizontal rectangles near [face]; [earlierOnly] keeps lower owners only. */
+        fun horizontalRects(grid: PlaneGrid, plane: Long, face: Rect2, earlierOnly: Boolean): List<Rect2> =
+            grid.near(plane, face).filter { !earlierOnly || it.rect.owner < face.owner }.map { it.rect }
 
-        fun sideRects(index: Map<Long, List<BoxSide>>, plane: Long, face: BoxSide): List<Rect2> =
-            index[plane].orEmpty().asSequence()
-                .filter { it.sign != face.sign || it.owner < face.owner }
-                .map { Rect2(it.minA, it.maxA, it.minY, it.maxY, it.owner) }
-                .toList()
+        fun sideRects(grid: PlaneGrid, plane: Long, face: Rect2, sign: Int): List<Rect2> =
+            grid.near(plane, face).filter { it.sign != sign || it.rect.owner < face.owner }.map { it.rect }
 
         boxes.forEachIndexed { owner, box ->
             val x0 = box.minX; val x1 = box.maxX
@@ -185,9 +177,10 @@ object TrackedTerrainMeshPlanner {
 
             // Top: hidden when another box starts on this exact plane over this
             // footprint. That is the face-cancellation rule, not a shrink test.
-            val topOccluders = horizontalRects(bottoms, q(y1)) +
-                horizontalRects(tops, q(y1)).filter { it.owner < owner }
-            for (face in visibleRects(Rect2(x0, x1, z0, z1, owner), topOccluders, owner)) {
+            val footprint = Rect2(x0, x1, z0, z1, owner)
+            val topOccluders = horizontalRects(bottoms, q(y1), footprint, false) +
+                horizontalRects(tops, q(y1), footprint, true)
+            for (face in visibleRects(footprint, topOccluders, owner)) {
                 addQuad(
                     Vec3(face.minA, y1, face.minB), Vec3(face.minA, y1, face.maxB),
                     Vec3(face.maxA, y1, face.maxB), Vec3(face.maxA, y1, face.minB),
@@ -198,10 +191,10 @@ object TrackedTerrainMeshPlanner {
             // bottom that is skipped is the region floor: nothing inside the
             // sampled volume can reach under it, and a skin there would double the
             // floor triangle count for no contact.
-            val bottomOccluders = horizontalRects(tops, q(y0)) +
-                horizontalRects(bottoms, q(y0)).filter { it.owner < owner }
+            val bottomOccluders = horizontalRects(tops, q(y0), footprint, false) +
+                horizontalRects(bottoms, q(y0), footprint, true)
             if (y0 > region.minY + HEIGHT_EPS) for (face in visibleRects(
-                Rect2(x0, x1, z0, z1, owner), bottomOccluders, owner,
+                footprint, bottomOccluders, owner,
             )) {
                 addQuad(
                     Vec3(face.minA, y0, face.maxB), Vec3(face.minA, y0, face.minB),
@@ -209,13 +202,9 @@ object TrackedTerrainMeshPlanner {
                     Vec3(0.0, -1.0, 0.0),
                 )
             }
-            val sideX = BoxSide(owner, z0, z1, y0, y1, -1)
             riserTop(ramps, 0, x0, y0, y1, z0, z1, terrain.maxClimbM)?.let { top ->
-                for (face in visibleRects(
-                    Rect2(z0, z1, y0, top, owner),
-                    sideRects(verticalX, q(x0), sideX),
-                    owner,
-                )) {
+                val wall = Rect2(z0, z1, y0, top, owner)
+                for (face in visibleRects(wall, sideRects(verticalX, q(x0), wall, -1), owner)) {
                     addQuad(
                         Vec3(x0, face.minB, face.minA), Vec3(x0, face.minB, face.maxA),
                         Vec3(x0, face.maxB, face.maxA), Vec3(x0, face.maxB, face.minA),
@@ -224,12 +213,8 @@ object TrackedTerrainMeshPlanner {
                 }
             }
             riserTop(ramps, 0, x1, y0, y1, z0, z1, terrain.maxClimbM)?.let { top ->
-                val faceSide = BoxSide(owner, z0, z1, y0, y1, 1)
-                for (face in visibleRects(
-                    Rect2(z0, z1, y0, top, owner),
-                    sideRects(verticalX, q(x1), faceSide),
-                    owner,
-                )) {
+                val wall = Rect2(z0, z1, y0, top, owner)
+                for (face in visibleRects(wall, sideRects(verticalX, q(x1), wall, 1), owner)) {
                     addQuad(
                         Vec3(x1, face.minB, face.maxA), Vec3(x1, face.minB, face.minA),
                         Vec3(x1, face.maxB, face.minA), Vec3(x1, face.maxB, face.maxA),
@@ -237,13 +222,9 @@ object TrackedTerrainMeshPlanner {
                     )
                 }
             }
-            val sideZ = BoxSide(owner, x0, x1, y0, y1, -1)
             riserTop(ramps, 1, z0, y0, y1, x0, x1, terrain.maxClimbM)?.let { top ->
-                for (face in visibleRects(
-                    Rect2(x0, x1, y0, top, owner),
-                    sideRects(verticalZ, q(z0), sideZ),
-                    owner,
-                )) {
+                val wall = Rect2(x0, x1, y0, top, owner)
+                for (face in visibleRects(wall, sideRects(verticalZ, q(z0), wall, -1), owner)) {
                     addQuad(
                         Vec3(face.maxA, face.minB, z0), Vec3(face.minA, face.minB, z0),
                         Vec3(face.minA, face.maxB, z0), Vec3(face.maxA, face.maxB, z0),
@@ -252,12 +233,8 @@ object TrackedTerrainMeshPlanner {
                 }
             }
             riserTop(ramps, 1, z1, y0, y1, x0, x1, terrain.maxClimbM)?.let { top ->
-                val faceSide = BoxSide(owner, x0, x1, y0, y1, 1)
-                for (face in visibleRects(
-                    Rect2(x0, x1, y0, top, owner),
-                    sideRects(verticalZ, q(z1), faceSide),
-                    owner,
-                )) {
+                val wall = Rect2(x0, x1, y0, top, owner)
+                for (face in visibleRects(wall, sideRects(verticalZ, q(z1), wall, 1), owner)) {
                     addQuad(
                         Vec3(face.minA, face.minB, z1), Vec3(face.maxA, face.minB, z1),
                         Vec3(face.maxA, face.maxB, z1), Vec3(face.minA, face.maxB, z1),
@@ -271,9 +248,7 @@ object TrackedTerrainMeshPlanner {
         // order, so the debug view can colour the exact triangles installed
         // into the Bullet mesh without guessing from the slope.
         val rampTriangleStart = indices.size / 3
-        for ((index, ramp) in ramps.withIndex()) {
-            addRampTriangles(ramp, index, ramps, terrain.maxClimbM, ::addQuad)
-        }
+        addSurfacePatches(ramps, corners, terrain.maxClimbM, ::addQuad)
 
         val vertexArray = FloatArray(vertices.size) { vertices[it] }
         val indexArray = IntArray(indices.size) { indices[it] }
@@ -297,17 +272,53 @@ object TrackedTerrainMeshPlanner {
             terrainRevision = terrainRevision,
             rampHeadingBucket = rampGate?.headingBucket ?: -1,
             rampTriangles = rampTriangles,
+            cornerPatchCount = corners.size,
         )
     }
 
-    /** One box footprint, used to index horizontal faces. */
-    private class BoxRect(
-        val owner: Int,
-        val minA: Double,
-        val maxA: Double,
-        val minB: Double,
-        val maxB: Double,
-    )
+    /** A rectangle stored in a [PlaneGrid]; [sign] is the outward side of a vertical face, 0 for horizontal. */
+    private class Slab(val rect: Rect2, val sign: Int)
+
+    /**
+     * Coplanar rectangles indexed by plane and by 1 m cell.
+     *
+     * A face only has to compare itself with the rectangles that share a cell
+     * with it, instead of with every rectangle on the plane. On a solid layer
+     * under a whole window that is the difference between a handful of
+     * comparisons per face and several hundred.
+     */
+    private class PlaneGrid {
+        private val planes = HashMap<Long, HashMap<Long, MutableList<Slab>>>()
+
+        fun add(plane: Long, rect: Rect2, sign: Int) {
+            val cells = planes.getOrPut(plane) { HashMap() }
+            val slab = Slab(rect, sign)
+            for (a in cellRange(rect.minA, rect.maxA)) for (b in cellRange(rect.minB, rect.maxB)) {
+                cells.getOrPut(cellKey(a, b)) { ArrayList(2) }.add(slab)
+            }
+        }
+
+        /** Distinct slabs on [plane] that share a cell with [face]. */
+        fun near(plane: Long, face: Rect2): List<Slab> {
+            val cells = planes[plane] ?: return emptyList()
+            val out = ArrayList<Slab>(4)
+            for (a in cellRange(face.minA, face.maxA)) for (b in cellRange(face.minB, face.maxB)) {
+                val list = cells[cellKey(a, b)] ?: continue
+                // A face touches a few cells and each holds a few slabs, so an
+                // identity scan beats hashing here.
+                for (slab in list) if (out.none { it === slab }) out += slab
+            }
+            return out
+        }
+
+        private fun cellRange(min: Double, max: Double): IntRange {
+            val first = floor(min + 1.0e-7).toInt()
+            val last = ceil(max - 1.0e-7).toInt() - 1
+            return first..maxOf(first, last)
+        }
+
+        private fun cellKey(a: Int, b: Int): Long = (a.toLong() shl 32) xor (b.toLong() and 0xffffffffL)
+    }
 
     /** A rectangle in the two coordinates spanning one planar face. */
     private data class Rect2(
@@ -318,16 +329,6 @@ object TrackedTerrainMeshPlanner {
         val owner: Int,
     )
 
-    /** One vertical face span, used to test whether a wall face is buried. */
-    private class BoxSide(
-        val owner: Int,
-        val minA: Double,
-        val maxA: Double,
-        val minY: Double,
-        val maxY: Double,
-        val sign: Int,
-    )
-
     /** Return all non-occluded rectangular pieces of [face]. */
     private fun uncoveredRectangles(face: Rect2, covers: List<Rect2>): List<Rect2> {
         if (face.maxA - face.minA <= HEIGHT_EPS || face.maxB - face.minB <= HEIGHT_EPS) return emptyList()
@@ -336,6 +337,13 @@ object TrackedTerrainMeshPlanner {
                 it.maxB > face.minB + HEIGHT_EPS && it.minB < face.maxB - HEIGHT_EPS
         }
         if (relevant.isEmpty()) return listOf(face)
+        // One cover that contains the whole face hides it. This is the common case
+        // for a buried face in a solid layer and needs no cut grid at all.
+        for (cover in relevant) {
+            if (cover.minA <= face.minA + HEIGHT_EPS && cover.maxA >= face.maxA - HEIGHT_EPS &&
+                cover.minB <= face.minB + HEIGHT_EPS && cover.maxB >= face.maxB - HEIGHT_EPS
+            ) return emptyList()
+        }
 
         val aCuts = (listOf(face.minA, face.maxA) + relevant.flatMap {
             listOf(it.minA.coerceIn(face.minA, face.maxA), it.maxA.coerceIn(face.minA, face.maxA))
@@ -357,43 +365,246 @@ object TrackedTerrainMeshPlanner {
         return visible
     }
 
-    private fun addRampTriangles(
-        ramp: TerrainRampPlan,
-        index: Int,
+    /**
+     * One piece of generated slope: a planar ramp strip, or the cone that joins
+     * two perpendicular strips around an outside corner of a raised block.
+     */
+    private sealed class Patch {
+        abstract val lowY: Double
+        abstract val highY: Double
+        abstract val minX: Double
+        abstract val maxX: Double
+        abstract val minZ: Double
+        abstract val maxZ: Double
+
+        /** Surface height at a world point, or null outside the footprint. */
+        abstract fun heightAt(x: Double, z: Double): Double?
+
+        fun contains(x: Double, z: Double): Boolean =
+            x >= minX - HEIGHT_EPS && x <= maxX + HEIGHT_EPS && z >= minZ - HEIGHT_EPS && z <= maxZ + HEIGHT_EPS
+    }
+
+    private class StripPatch(val ramp: TerrainRampPlan) : Patch() {
+        private val bounds = rampBounds(ramp)
+        override val lowY get() = ramp.lowY
+        override val highY get() = ramp.highY
+        override val minX get() = bounds[0]
+        override val maxX get() = bounds[1]
+        override val minZ get() = bounds[2]
+        override val maxZ get() = bounds[3]
+        override fun heightAt(x: Double, z: Double): Double? = rampHeightAt(ramp, x, z)
+    }
+
+    /**
+     * Elliptic cone around the outside corner ([cornerX], [cornerZ]).
+     *
+     * [signX] and [signZ] point from the corner into the low quadrant. Along the
+     * quadrant's two straight edges the cone has exactly the height of the strip
+     * it touches, so the joint is continuous: `h = high - rise * |(dx/runX, dz/runZ)|`.
+     */
+    private class CornerPatch(
+        val cornerX: Double,
+        val cornerZ: Double,
+        val signX: Int,
+        val signZ: Int,
+        val runX: Double,
+        val runZ: Double,
+        override val lowY: Double,
+        override val highY: Double,
+    ) : Patch() {
+        override val minX get() = if (signX > 0) cornerX else cornerX - runX
+        override val maxX get() = if (signX > 0) cornerX + runX else cornerX
+        override val minZ get() = if (signZ > 0) cornerZ else cornerZ - runZ
+        override val maxZ get() = if (signZ > 0) cornerZ + runZ else cornerZ
+
+        override fun heightAt(x: Double, z: Double): Double? {
+            if (!contains(x, z)) return null
+            val u = abs(x - cornerX) / runX
+            val v = abs(z - cornerZ) / runZ
+            val distance = kotlin.math.sqrt(u * u + v * v)
+            if (distance >= 1.0) return lowY
+            return highY - (highY - lowY) * distance
+        }
+    }
+
+    private fun sameLayer(a: Patch, b: Patch, maxClimb: Double): Boolean =
+        max(a.lowY, a.highY) + maxClimb >= min(b.lowY, b.highY) - HEIGHT_EPS &&
+            max(b.lowY, b.highY) + maxClimb >= min(a.lowY, a.highY) - HEIGHT_EPS
+
+    private fun overlaps(a: Patch, b: Patch): Boolean =
+        a.minX < b.maxX - HEIGHT_EPS && a.maxX > b.minX + HEIGHT_EPS &&
+            a.minZ < b.maxZ - HEIGHT_EPS && a.maxZ > b.minZ + HEIGHT_EPS
+
+    /**
+     * Triangulate every generated slope as one continuous surface per layer.
+     *
+     * - Every vertex takes the **highest** same-layer patch at that point, so two
+     *   overlapping ramps meet along a continuous crease instead of leaving a
+     *   hump or a seam, and the corner cones join perpendicular strips.
+     * - A cell is emitted only by the patch that is highest at the cell centre,
+     *   so overlapping patches never produce two coincident surfaces.
+     * - Strips that overlap nothing keep ~1 block quads (Bullet needs vertices
+     *   under the wheels, see [build]); overlapping strips and corners use
+     *   [COUPLE_CELL] so the crease is followed closely.
+     * - Patches from another layer (a deck several blocks up) are ignored.
+     */
+    private fun addSurfacePatches(
         ramps: List<TerrainRampPlan>,
+        corners: List<Patch>,
         maxClimb: Double,
         addQuad: (Vec3, Vec3, Vec3, Vec3, Vec3) -> Unit,
     ) {
+        val patches: List<Patch> = ramps.map { StripPatch(it) } + corners
+        if (patches.isEmpty()) return
         val up = Vec3(0.0, 1.0, 0.0)
-        // Split both ways into ~1 block quads. Bullet builds a mesh contact
-        // from triangle vertices and edges; a 3 m quad whose vertices sit at
-        // the foot and the riser reports no contact under the wheels in
-        // between, so the road wheel drops back to the floor in front of the
-        // step. A ramp that crosses another same-layer ramp is split finer so
-        // the lower envelope can follow the intersection instead of keeping
-        // both penetrating quads.
-        if (ramp.runM <= 1.0e-6) return
-        val step = if (needsCoupling(ramp, index, ramps, maxClimb)) COUPLE_CELL else 1.0
-        var lateral = ramp.lateralMin
-        while (lateral < ramp.lateralMax - 1.0e-9) {
-            val lateralEnd = min(ramp.lateralMax, lateral + step)
-            var along = 0.0
-            while (along < ramp.runM - 1.0e-9) {
-                val alongEnd = min(ramp.runM, along + step)
-                val sample = rampPoint(ramp, (along + alongEnd) * 0.5, (lateral + lateralEnd) * 0.5)
-                if (!surfaceSuppressed(ramp, index, ramps, sample.x, sample.z, maxClimb)) {
-                    addQuad(
-                        rampPoint(ramp, along, lateral),
-                        rampPoint(ramp, along, lateralEnd),
-                        rampPoint(ramp, alongEnd, lateralEnd),
-                        rampPoint(ramp, alongEnd, lateral),
-                        up,
-                    )
-                }
-                along = alongEnd
-            }
-            lateral = lateralEnd
+        val layer = patches.indices.map { index ->
+            patches.indices.filter { other -> sameLayer(patches[index], patches[other], maxClimb) }
         }
+
+        fun envelope(index: Int, x: Double, z: Double): Double? {
+            var best: Double? = null
+            for (other in layer[index]) {
+                val height = patches[other].heightAt(x, z) ?: continue
+                if (best == null || height > best) best = height
+            }
+            return best
+        }
+
+        fun owns(index: Int, x: Double, z: Double): Boolean {
+            val own = patches[index].heightAt(x, z) ?: return false
+            for (other in layer[index]) {
+                if (other == index) continue
+                val height = patches[other].heightAt(x, z) ?: continue
+                if (height > own + HEIGHT_EPS) return false
+                if (abs(height - own) <= HEIGHT_EPS && other < index) return false
+            }
+            return true
+        }
+
+        for ((index, patch) in patches.withIndex()) {
+            val fine = patch is CornerPatch || layer[index].any { it != index && overlaps(patch, patches[it]) }
+            val step = if (fine) COUPLE_CELL else 1.0
+            var x = patch.minX
+            while (x < patch.maxX - 1.0e-9) {
+                val x1 = min(patch.maxX, x + step)
+                var z = patch.minZ
+                while (z < patch.maxZ - 1.0e-9) {
+                    val z1 = min(patch.maxZ, z + step)
+                    if (owns(index, (x + x1) * 0.5, (z + z1) * 0.5)) {
+                        val h00 = envelope(index, x, z)
+                        val h01 = envelope(index, x, z1)
+                        val h11 = envelope(index, x1, z1)
+                        val h10 = envelope(index, x1, z)
+                        if (h00 != null && h01 != null && h11 != null && h10 != null) {
+                            // A corner cell entirely at floor height would duplicate
+                            // the block top that is already in the mesh.
+                            val flat = patch is CornerPatch &&
+                                maxOf(h00, h01, h11, h10) <= patch.lowY + HEIGHT_EPS
+                            if (!flat) {
+                                addQuad(Vec3(x, h00, z), Vec3(x, h01, z1), Vec3(x1, h11, z1), Vec3(x1, h10, z), up)
+                            }
+                        }
+                    }
+                    z = z1
+                }
+                x = x1
+            }
+        }
+    }
+
+    /**
+     * Outside corners where two perpendicular ramps of the same rise meet.
+     *
+     * Ramp A climbs along X onto face `x = X0`, ramp B climbs along Z onto face
+     * `z = Z0`. They share the outside corner (X0, Z0) of one raised block when
+     * A's lateral range starts at Z0 on B's raised side and B's starts at X0 on
+     * A's raised side. The low quadrant between them gets a [CornerPatch], but
+     * only over real, unobstructed low surface.
+     */
+    private fun planCorners(boxes: BoxIndex, ramps: List<TerrainRampPlan>): List<Patch> {
+        val out = ArrayList<Patch>()
+        val seen = HashSet<Long>()
+        val alongX = ramps.filter { it.direction == RampDirection.EAST || it.direction == RampDirection.WEST }
+        val alongZ = ramps.filter { it.direction == RampDirection.SOUTH || it.direction == RampDirection.NORTH }
+        for (a in alongX) for (b in alongZ) {
+            if (abs(a.lowY - b.lowY) > HEIGHT_EPS || abs(a.highY - b.highY) > HEIGHT_EPS) continue
+            val climbX = if (a.direction == RampDirection.EAST) 1 else -1
+            val climbZ = if (b.direction == RampDirection.SOUTH) 1 else -1
+            val cornerX = a.highX
+            val cornerZ = b.highZ
+            // A's strip must start at the corner and run onto B's raised side;
+            // B's strip must start at the corner and run onto A's raised side.
+            val aStart = if (climbZ > 0) a.lateralMin else a.lateralMax
+            val bStart = if (climbX > 0) b.lateralMin else b.lateralMax
+            if (abs(aStart - cornerZ) > HEIGHT_EPS || abs(bStart - cornerX) > HEIGHT_EPS) continue
+            val key = (q(cornerX) shl 32) xor (q(cornerZ) and 0xffffffffL) xor (q(a.lowY) shl 16)
+            if (!seen.add(key)) continue
+            val corner = CornerPatch(
+                cornerX = cornerX,
+                cornerZ = cornerZ,
+                signX = -climbX,
+                signZ = -climbZ,
+                runX = a.runM,
+                runZ = b.runM,
+                lowY = a.lowY,
+                highY = a.highY,
+            )
+            if (!surfaceCovered(boxes, corner.minX, corner.maxX, corner.minZ, corner.maxZ, a.lowY)) continue
+            if (!volumeClear(boxes, corner.minX, corner.maxX, corner.minZ, corner.maxZ, a.lowY, a.highY)) continue
+            out += corner
+        }
+        return out
+    }
+
+    /** True when no box occupies the column above [lowY] and below [highY] over the rectangle. */
+    private fun volumeClear(
+        boxes: BoxIndex,
+        minX: Double,
+        maxX: Double,
+        minZ: Double,
+        maxZ: Double,
+        lowY: Double,
+        highY: Double,
+    ): Boolean {
+        for (box in boxes.query(minX, maxX, minZ, maxZ)) {
+            if (box.maxX <= minX + HEIGHT_EPS || box.minX >= maxX - HEIGHT_EPS) continue
+            if (box.maxZ <= minZ + HEIGHT_EPS || box.minZ >= maxZ - HEIGHT_EPS) continue
+            if (box.maxY > lowY + HEIGHT_EPS && box.minY < highY - HEIGHT_EPS) return false
+        }
+        return true
+    }
+
+    /**
+     * Uniform cell index over the detached boxes. Every geometric query in the
+     * planner touches a few cells instead of every box in the window.
+     */
+    private class BoxIndex(val boxes: List<TerrainBox>) {
+        private val cells = HashMap<Long, MutableList<Int>>()
+
+        init {
+            boxes.forEachIndexed { index, box ->
+                val x0 = floor(box.minX + 1.0e-7).toInt()
+                val x1 = ceil(box.maxX - 1.0e-7).toInt() - 1
+                val z0 = floor(box.minZ + 1.0e-7).toInt()
+                val z1 = ceil(box.maxZ - 1.0e-7).toInt() - 1
+                for (x in x0..x1) for (z in z0..z1) cells.getOrPut(key(x, z)) { ArrayList(2) }.add(index)
+            }
+        }
+
+        fun query(minX: Double, maxX: Double, minZ: Double, maxZ: Double): Sequence<TerrainBox> {
+            val x0 = floor(minX - 1.0e-7).toInt()
+            val x1 = floor(maxX + 1.0e-7).toInt()
+            val z0 = floor(minZ - 1.0e-7).toInt()
+            val z1 = floor(maxZ + 1.0e-7).toInt()
+            val seen = HashSet<Int>()
+            val out = ArrayList<TerrainBox>()
+            for (x in x0..x1) for (z in z0..z1) {
+                for (index in cells[key(x, z)].orEmpty()) if (seen.add(index)) out += boxes[index]
+            }
+            return out.asSequence()
+        }
+
+        private fun key(x: Int, z: Int): Long = (x.toLong() shl 32) xor (z.toLong() and 0xffffffffL)
     }
 
     /** Point on the ramp, [along] metres up the climb and [lateral] on the face. */
@@ -409,12 +620,12 @@ object TrackedTerrainMeshPlanner {
     }
 
     private fun planRamps(
-        boxes: List<TerrainBox>,
+        boxes: BoxIndex,
         terrain: CompiledTerrain,
         gate: RampGate?,
     ): List<TerrainRampPlan> {
         if (terrain.stepM <= MIN_RISE || terrain.maxClimbM <= MIN_RISE) return emptyList()
-        val cells = cellTops(boxes)
+        val cells = cellTops(boxes.boxes)
         if (cells.isEmpty()) return emptyList()
         val candidates = ArrayList<Candidate>()
         val directions = arrayOf(
@@ -539,7 +750,7 @@ object TrackedTerrainMeshPlanner {
      * The returned length is the ramp that can be installed without crossing air.
      */
     private fun coveredApproachLength(
-        boxes: List<TerrainBox>,
+        boxes: BoxIndex,
         direction: RampDirection,
         face: Double,
         step: Double,
@@ -622,7 +833,7 @@ object TrackedTerrainMeshPlanner {
      * AABB touches it, including a stair that covers a quarter of the cell.
      */
     private fun surfaceCovered(
-        boxes: List<TerrainBox>,
+        boxes: BoxIndex,
         minX: Double,
         maxX: Double,
         minZ: Double,
@@ -631,7 +842,7 @@ object TrackedTerrainMeshPlanner {
     ): Boolean {
         if (maxX - minX <= HEIGHT_EPS || maxZ - minZ <= HEIGHT_EPS) return false
         val covers = ArrayList<Rect2>()
-        for (box in boxes) {
+        for (box in boxes.query(minX, maxX, minZ, maxZ)) {
             if (abs(box.maxY - topY) > HEIGHT_EPS) continue
             if (box.maxY - box.minY <= HEIGHT_EPS) continue
             if (box.maxX <= minX + HEIGHT_EPS || box.minX >= maxX - HEIGHT_EPS) continue
@@ -649,7 +860,7 @@ object TrackedTerrainMeshPlanner {
     }
 
     private fun hasRampClearance(
-        boxes: List<TerrainBox>,
+        boxes: BoxIndex,
         direction: RampDirection,
         cellX: Int,
         cellZ: Int,
@@ -660,7 +871,7 @@ object TrackedTerrainMeshPlanner {
     ): Boolean {
         val range = runCellRange(direction, cellX, cellZ, face, step) ?: return false
         for ((x, z) in range) {
-            for (box in boxes) {
+            for (box in boxes.query(x.toDouble(), x + 1.0, z.toDouble(), z + 1.0)) {
                 if (box.maxX <= x + HEIGHT_EPS || box.minX >= x + 1.0 - HEIGHT_EPS) continue
                 if (box.maxZ <= z + HEIGHT_EPS || box.minZ >= z + 1.0 - HEIGHT_EPS) continue
                 if (box.maxY > lowY + HEIGHT_EPS && box.minY < highY - HEIGHT_EPS) return false
@@ -750,7 +961,7 @@ object TrackedTerrainMeshPlanner {
         maxClimb: Double,
     ): Double? {
         var top = maxY
-        for ((index, ramp) in ramps.withIndex()) {
+        for (ramp in ramps) {
             val matches = when {
                 axis == 0 && ramp.direction == RampDirection.EAST -> abs(plane - ramp.highX) <= HEIGHT_EPS
                 axis == 0 && ramp.direction == RampDirection.WEST -> abs(plane - ramp.highX) <= HEIGHT_EPS
@@ -761,87 +972,13 @@ object TrackedTerrainMeshPlanner {
             if (!matches) continue
             if (minOther < ramp.lateralMin - HEIGHT_EPS || maxOther > ramp.lateralMax + HEIGHT_EPS) continue
             if (maxY <= ramp.lowY + HEIGHT_EPS || minY >= ramp.highY - HEIGHT_EPS) continue
-            // A ramp that lost this face to a lower same-layer surface must not
-            // delete the wall. Removing it would leave a hole where the winning
-            // surface does not reach the riser.
-            val mid = (minOther + maxOther) * 0.5
-            val sampleX = if (axis == 0) plane else mid
-            val sampleZ = if (axis == 0) mid else plane
-            if (surfaceSuppressed(ramp, index, ramps, sampleX, sampleZ, maxClimb)) continue
+            // At its own riser a ramp is at its full height. With the upper
+            // envelope it is either the surface there or lies under a higher
+            // same-layer surface; in both cases the covered riser is not a wall.
             top = min(top, ramp.lowY)
         }
         if (top <= minY + HEIGHT_EPS) return null
         return top
-    }
-
-    /**
-     * True when [ramp] crosses or stacks on another ramp in the same climb band.
-     *
-     * A deck several metres above the ground overlaps in XZ but is a different
-     * layer: both surfaces stay. Taking a global maximum would fill the gap
-     * under the deck.
-     */
-    private fun needsCoupling(
-        ramp: TerrainRampPlan,
-        index: Int,
-        ramps: List<TerrainRampPlan>,
-        maxClimb: Double,
-    ): Boolean {
-        for (other in ramps.indices) {
-            if (other == index) continue
-            val candidate = ramps[other]
-            if (overlapsXZ(ramp, candidate) && heightBandsOverlap(ramp, candidate, maxClimb)) return true
-        }
-        return false
-    }
-
-    /**
-     * True when a lower same-layer ramp already owns this point.
-     *
-     * Equal heights keep the earlier ramp so the seam is not emitted twice.
-     * A surface more than [maxClimb] below is another layer and does not win.
-     */
-    private fun surfaceSuppressed(
-        ramp: TerrainRampPlan,
-        index: Int,
-        ramps: List<TerrainRampPlan>,
-        x: Double,
-        z: Double,
-        maxClimb: Double,
-    ): Boolean {
-        val height = rampHeightAt(ramp, x, z) ?: return true
-        for (otherIndex in ramps.indices) {
-            if (otherIndex == index) continue
-            val otherHeight = rampHeightAt(ramps[otherIndex], x, z) ?: continue
-            val gap = height - otherHeight
-            if (gap > maxClimb + HEIGHT_EPS) continue
-            if (gap < -HEIGHT_EPS) continue
-            if (gap <= HEIGHT_EPS && otherIndex > index) continue
-            return true
-        }
-        return false
-    }
-
-    /**
-     * True when the ramp surface passes through the inner band of a gear probe.
-     *
-     * Contact at the bottom of a wheel is not a cut. The inner band is the
-     * middle 70 percent of the probe, so a slope the wheel is sitting on stays.
-     */
-    private fun rampCutsGear(ramp: TerrainRampPlan, gear: List<GearProbe>): Boolean {
-        if (gear.isEmpty() || ramp.runM <= MIN_RISE) return false
-        val bounds = rampBounds(ramp)
-        for (probe in gear) {
-            if (probe.halfY <= MIN_RISE) continue
-            val x = probe.x.coerceIn(bounds[0], bounds[1])
-            val z = probe.z.coerceIn(bounds[2], bounds[3])
-            if (abs(x - probe.x) > probe.halfX + HEIGHT_EPS) continue
-            if (abs(z - probe.z) > probe.halfZ + HEIGHT_EPS) continue
-            val height = rampHeightAt(ramp, x, z) ?: continue
-            val inner = probe.halfY * 0.35
-            if (height > probe.y - inner && height < probe.y + inner) return true
-        }
-        return false
     }
 
     /** minX, maxX, minZ, maxZ of one ramp footprint. */

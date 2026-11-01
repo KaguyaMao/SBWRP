@@ -8,11 +8,38 @@
     "AngularLimitDegrees": 40.0,
     "LinkCount": 79,
     "Clearance": 0.002,
-    "LinkMass": 18.0
+    "LinkMass": 18.0,
+    "Topology": "EnvelopeBelt",
+    "Chain": {
+      "UnitPitches": 2.0,
+      "MaxBendDegrees": 40.0,
+      "TopPieces": 1,
+      "BottomCollisionThickness": 0.3,
+      "UnitInertiaScale": 16.0,
+      "SolverSubsteps": 2
+    },
+    "Envelope": {
+      "MinPiecePitches": 2.0,
+      "MaxPieces": 13,
+      "MaxBendDegrees": 40.0,
+      "SplitDegrees": 3.0,
+      "MergeDegrees": 1.0,
+      "HoldSeconds": 0.5,
+      "ContactBand": 0.15,
+      "CollisionMargin": 0.02,
+      "UnitInertiaScale": 1.0,
+      "SolverSubsteps": 2,
+      "SolverIterations": 60,
+      "Tension": 20000.0,
+      "TensionDamping": 8000.0,
+      "TensionTravel": 0.3
+    }
   },
   "Left": {
     "LinkTemplateBone": "trackRotL0",
     "VisibleBonePrefix": "trackRotL",
+    "EnvelopeAnchorBone": "PointL",
+    "AlignWheelsToBelt": true,
     "Suspension": {
       "TravelUp": 0.18,
       "TravelDown": 0.24,
@@ -23,7 +50,7 @@
     },
     "Wheels": [
       {
-        "Bone": "wheelL0",
+        "Bone": "followL",
         "Role": "IdlerGuide",
         "LoadShare": 0.0,
         "Mass": 400.0,
@@ -86,7 +113,7 @@
         "Wrap": "Outside"
       },
       {
-        "Bone": "wheelL7",
+        "Bone": "leadL",
         "Role": "DriveGuide",
         "LoadShare": 0.0,
         "Mass": 400.0,
@@ -96,20 +123,22 @@
       }
     ],
     "BeltOrder": [
-      "wheelL0",
+      "followL",
       "wheelL1",
       "wheelL2",
       "wheelL3",
       "wheelL4",
       "wheelL5",
       "wheelL6",
-      "wheelL7"
+      "leadL"
     ],
-    "RunMassBudgetKg": 1422.0
+    "RunMassBudgetKg": 5688.0
   },
   "Right": {
     "LinkTemplateBone": "trackRotR0",
     "VisibleBonePrefix": "trackRotR",
+    "EnvelopeAnchorBone": "PointR",
+    "AlignWheelsToBelt": true,
     "Suspension": {
       "TravelUp": 0.18,
       "TravelDown": 0.24,
@@ -120,7 +149,7 @@
     },
     "Wheels": [
       {
-        "Bone": "wheelR0",
+        "Bone": "followR",
         "Role": "IdlerGuide",
         "LoadShare": 0.0,
         "Mass": 400.0,
@@ -183,7 +212,7 @@
         "Wrap": "Outside"
       },
       {
-        "Bone": "wheelR7",
+        "Bone": "leadR",
         "Role": "DriveGuide",
         "LoadShare": 0.0,
         "Mass": 400.0,
@@ -193,16 +222,16 @@
       }
     ],
     "BeltOrder": [
-      "wheelR0",
+      "followR",
       "wheelR1",
       "wheelR2",
       "wheelR3",
       "wheelR4",
       "wheelR5",
       "wheelR6",
-      "wheelR7"
+      "leadR"
     ],
-    "RunMassBudgetKg": 1422.0
+    "RunMassBudgetKg": 5688.0
   },
   "Terrain": {
     "BulletRamps": {
@@ -210,10 +239,17 @@
       "MaxClimb": 1.0,
       "Step": 3.0
     },
-    "WindowRadius": 6,
+    "WindowRadius": 12,
     "VerticalAbove": 3,
     "VerticalBelow": 4
   },
+  "HullCollision": [
+    { "Size": [1.40, 0.625, 4.15], "Position": [0.0, 1.25, -0.25] },
+    { "Size": [1.40, 0.20, 1.90], "Position": [0.0, 2.07, -2.60] },
+    { "Size": [1.40, 0.145, 0.55], "Position": [0.0, 2.02, 3.20] },
+    { "Size": [0.43, 0.17, 4.35], "Position": [1.86, 1.81, -0.20] },
+    { "Size": [0.43, 0.17, 4.35], "Position": [-1.86, 1.81, -0.20] }
+  ],
   "Drivetrain": {
     "MaxDriveTorque": 160000.0,
     "MaxBrakeTorque": 320000.0,

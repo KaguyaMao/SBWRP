@@ -52,6 +52,7 @@ object TrackedTerrainDebugClient {
         val chunkCount: Int,
         val truncated: Boolean,
         val chunks: Array<FloatArray?>,
+        val origin: FloatArray,
     ) {
         fun complete(): Boolean = chunks.all { it != null }
 
@@ -65,14 +66,21 @@ object TrackedTerrainDebugClient {
                 chunk.copyInto(packed, cursor)
                 cursor += chunk.size
             }
-            return ShapeView(epoch, truncated, packed)
+            return ShapeView(epoch, truncated, packed, entityId = -1, origin = origin)
         }
     }
 
+    /**
+     * Chassis-local edges of one vehicle. [origin] is the chassis body origin in
+     * the vehicle data frame; the renderer applies the vehicle's own interpolated
+     * transform, so the edges move with the drawn model.
+     */
     class ShapeView(
         val epoch: Long,
         val truncated: Boolean,
         val segments: FloatArray,
+        val entityId: Int = -1,
+        val origin: FloatArray = FloatArray(3),
     ) {
         val segmentCount: Int get() = segments.size / TrackedCollisionDebug.FLOATS_PER_SEGMENT
     }
@@ -132,13 +140,15 @@ object TrackedTerrainDebugClient {
                 message.chunkCount,
                 message.truncated,
                 arrayOfNulls(message.chunkCount),
+                floatArrayOf(message.originX, message.originY, message.originZ),
             ).also { shapePartials[message.entityId] = it }
         } else {
             current
         }
         if (message.chunkIndex < partial.chunks.size) partial.chunks[message.chunkIndex] = message.segments
         if (partial.complete()) {
-            shapes[message.entityId] = partial.build()
+            val built = partial.build()
+            shapes[message.entityId] = ShapeView(built.epoch, built.truncated, built.segments, message.entityId, built.origin)
             shapePartials.remove(message.entityId)
         }
     }

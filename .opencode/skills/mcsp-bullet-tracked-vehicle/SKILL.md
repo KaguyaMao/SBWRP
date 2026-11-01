@@ -24,8 +24,11 @@ description: Plan, implement, review, or diagnose MCSP-style tracked vehicle phy
 
 - 动态负重轮和独立悬挂。
 - 主动轮、导动轮、张紧器和动态履带运行段。
-- 运行段按相邻轮对组织，两端约束到不自转的轮端刚体。
-- 物理运行段和可见重复链节是两套对象，但共享包络输入。
+- 运行段由数据选择拓扑：`EnvelopeBelt`（99A 生产：贴轮包络、底部初始一整块并随地形动态拆合）、
+  `AnchorChain`（已取代）或 `WheelPairRuns`（相邻轮对，两端约束到不自转的轮端刚体）。
+- 物理运行段和可见重复链节是两套对象；`EnvelopeBelt`/`AnchorChain` 下可见链节沿物理履带中心线排列。
+- 长履带不得用逐关节 `overrideIterations`；需要更多收敛时请求核心的世界级 `solverIterations`，否则关节
+  会在接触/摩擦停止后继续单独修正，造成静止车辆爬行。
 - 基础地形是 Minecraft 方块 AABB。
 - 台阶辅助是 SBW 可选策略，不是核心高度场；旧 `VehicleBody.stepAssist` 的无界/永久抬升
   已撤销，S3.2 的受限 `TrackedStepAssist` 仍未实现。
@@ -40,7 +43,7 @@ description: Plan, implement, review, or diagnose MCSP-style tracked vehicle phy
 - 车辆、地形策略、驱动、渲染和验收全部在 SBW。
 - 不使用 `LocalHeightField`、`TerrainSupportField`、`SUPPORT_PAIR`、`HEIGHT_FIELD`、
   `SLOPE`、`RUN_BLOCKS`、探针承载、固定楔面或人工抬升。
-- 可见链节不是物理刚体，不与物理运行段一一绑定。
+- 可见链节不是物理刚体，不与物理运行段一一绑定；`EnvelopeBelt`/`AnchorChain` 下只共享中心线折线。
 - 运行段数、可见链节数和模型骨骼数分别记录。
 - 运行段第二端只锁一个法向平移，不得做成三平移全锁。
 - 带内轮端刚体无独立轮面自转；可见轮面自转只服务渲染。

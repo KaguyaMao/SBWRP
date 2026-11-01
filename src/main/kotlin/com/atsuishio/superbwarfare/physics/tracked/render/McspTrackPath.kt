@@ -163,6 +163,70 @@ internal object McspTrackPath {
         return Path(distance, pieces)
     }
 
+    /**
+     * Closed path through belt pins, chassis Y/Z, in loop order.
+     *
+     * This is the physical belt itself: the visible plates are laid on the same
+     * polyline the dynamic belt bodies form, so a fold in the physics is a fold
+     * on screen. [reference] fixes the travel direction to the wheel envelope's,
+     * so plates keep their template orientation.
+     */
+    fun polyline(y: List<Double>, z: List<Double>, reference: Path? = null): Path? {
+        val count = minOf(y.size, z.size)
+        if (count < 3) return null
+        if ((0 until count).any { !y[it].isFinite() || !z[it].isFinite() }) return null
+        var ys = y.take(count)
+        var zs = z.take(count)
+        if (reference != null && signedArea(reference) * polygonArea(ys, zs) < 0.0) {
+            ys = ys.reversed()
+            zs = zs.reversed()
+        }
+        val pieces = ArrayList<Piece>(count)
+        var distance = 0.0
+        for (index in 0 until count) {
+            val next = (index + 1) % count
+            val modelZ = -zs[index]
+            val modelNextZ = -zs[next]
+            val length = hypot(modelNextZ - modelZ, ys[next] - ys[index])
+            if (length <= 1.0e-6) continue
+            pieces += Piece(
+                arc = false,
+                s0 = distance,
+                a = modelZ,
+                b = ys[index],
+                c = (modelNextZ - modelZ) / length,
+                d = (ys[next] - ys[index]) / length,
+                e = 0.0,
+            )
+            distance += length
+        }
+        if (pieces.size < 3 || distance <= 1.0e-4) return null
+        return Path(distance, pieces)
+    }
+
+    /** Signed area of a sampled path in model Z/Y; the sign is the travel direction. */
+    private fun signedArea(path: Path): Double {
+        val samples = 64
+        val ys = ArrayList<Double>(samples)
+        val zs = ArrayList<Double>(samples)
+        for (index in 0 until samples) {
+            val sample = path.at(path.length * index / samples)
+            ys += sample.y
+            zs += sample.z
+        }
+        return polygonArea(ys, zs)
+    }
+
+    /** Shoelace area in model Z (= -chassis Z) and Y. */
+    private fun polygonArea(ys: List<Double>, zs: List<Double>): Double {
+        var area = 0.0
+        for (index in ys.indices) {
+            val next = (index + 1) % ys.size
+            area += (-zs[index]) * ys[next] - (-zs[next]) * ys[index]
+        }
+        return area * 0.5
+    }
+
     fun visibleCount(restLength: Double, visiblePitch: Double): Int {
         if (!restLength.isFinite() || restLength <= 0.0 || !visiblePitch.isFinite() || visiblePitch <= 1.0e-4) return 0
         return max(1, ceil(restLength / visiblePitch - 0.001).toInt())

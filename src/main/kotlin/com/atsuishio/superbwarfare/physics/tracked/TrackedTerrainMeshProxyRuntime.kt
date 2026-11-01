@@ -25,6 +25,9 @@ class TrackedTerrainMeshProxyRuntime(
     private val vehicleId: String,
 ) {
     @Volatile private var body: PhysicsRigidBody? = null
+
+    /** The installed mesh body, or null. Physics thread readers only. */
+    val installedBody: PhysicsRigidBody? get() = body
     @Volatile var installedHash: Long = Long.MIN_VALUE
         private set
     @Volatile var rampCount: Int = 0
@@ -217,7 +220,15 @@ class TrackedTerrainMeshProxyRuntime(
             )
         }
         val mesh = IndexedMesh(points, plan.indices)
-        val shape = MeshCollisionShape(true, mesh).apply { margin = .001f }
+        // Do not enable Bullet's internal-edge contact filter here. The belt
+        // chain prototype (TrackedBeltChainNativeTest) measured it dropping valid
+        // contacts under thin boxes: a 98 mm belt unit on flat mesh ground sank
+        // 88 mm through it with the filter on, and 0-15 mm with it off.
+        // A 0.02 m margin keeps thin belt boxes in a stable contact band instead
+        // of one millimetre deep (TrackedEnvelopeBeltNativeTest). Bullet adds the
+        // margin above the triangles, so the mesh is lowered by the same amount
+        // and the contact surface stays on the block tops.
+        val shape = MeshCollisionShape(true, mesh).apply { margin = MESH_MARGIN }
         val proxy = PhysicsRigidBody(shape, 0f).apply {
             name = "sbw_tracked_terrain_${vehicleId}_${plan.contentHash}"
             owner = host
@@ -229,9 +240,14 @@ class TrackedTerrainMeshProxyRuntime(
             // applies before that first write.
             friction = .5f
             restitution = 0f
-            setPhysicsLocation(Vector3f(plan.originX.toFloat(), plan.originY.toFloat(), plan.originZ.toFloat()))
+            setPhysicsLocation(Vector3f(plan.originX.toFloat(), plan.originY.toFloat() - MESH_MARGIN, plan.originZ.toFloat()))
         }
         TrackedTerrainCollision.register(proxy, host)
         return proxy
+    }
+
+    companion object {
+        /** Contact margin of the terrain mesh, metres; the mesh is lowered by it. */
+        const val MESH_MARGIN = 0.02f
     }
 }

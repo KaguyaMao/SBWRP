@@ -62,6 +62,16 @@ data class TrackedVehicleDefinition(
      */
     @SerialName("Terrain")
     var terrain: TrackedTerrainDefinition = TrackedTerrainDefinition(),
+
+    /**
+     * Solid hull boxes for the Bullet chassis, in the vehicle data frame
+     * (metres, same frame as the vehicle `OBB` list). When present they replace
+     * the hull parts derived from the gameplay OBBs for physics only; damage and
+     * hit detection keep using the OBBs. They must stay clear of every wheel and
+     * belt body, which the compiler checks.
+     */
+    @SerialName("HullCollision")
+    var hullCollision: MutableList<TrackHullBoxDefinition> = mutableListOf(),
 ) {
     fun side(side: TrackedSide): TrackSideDefinition = when (side) {
         TrackedSide.LEFT -> left
@@ -114,6 +124,161 @@ data class TrackMechanismDefinition(
      */
     @SerialName("LinkMass")
     var linkMass: Double = 0.0,
+
+    /** Physical belt topology; see [TrackTopology]. */
+    @SerialName("Topology")
+    var topology: TrackTopology = TrackTopology.WHEEL_PAIR_RUNS,
+
+    /** Parameters of [TrackTopology.ANCHOR_CHAIN]; ignored by the other topology. */
+    @SerialName("Chain")
+    var chain: TrackChainDefinition = TrackChainDefinition(),
+
+    /** Parameters of [TrackTopology.ENVELOPE_BELT]; ignored by the other topologies. */
+    @SerialName("Envelope")
+    var envelope: TrackEnvelopeDefinition = TrackEnvelopeDefinition(),
+)
+
+/** How the physical belt is built from the compiled mechanism. */
+@Serializable
+enum class TrackTopology {
+    /** One rigid run per adjacent wheel pair (MCSP layout). */
+    @SerialName("WheelPairRuns")
+    WHEEL_PAIR_RUNS,
+
+    /**
+     * One closed belt from the side's envelope anchors; the bottom run is a hinged
+     * chain of equal units that folds where terrain and suspension make it.
+     * Requires `EnvelopeAnchorBone` on both sides.
+     */
+    @SerialName("AnchorChain")
+    ANCHOR_CHAIN,
+
+    /**
+     * One closed belt fitted to the wheel envelope. Wrap arcs ride on the guide
+     * wheels; the front incline, bottom, rear incline and top return are rigid
+     * spans pinned end to end. The bottom starts as one body and is split and
+     * merged at run time where terrain bends it. Anchors are only checked.
+     */
+    @SerialName("EnvelopeBelt")
+    ENVELOPE_BELT,
+}
+
+/** Envelope belt parameters. Every value is data so a vehicle never needs code. */
+@Serializable
+data class TrackEnvelopeDefinition(
+    /** Shortest bottom piece a split may leave, in visible link pitches. */
+    @SerialName("MinPiecePitches")
+    var minPiecePitches: Double = 2.0,
+
+    /** Most bottom pieces one side may have at once. */
+    @SerialName("MaxPieces")
+    var maxPieces: Int = 13,
+
+    /** Bend each pin may make away from its rest angle, degrees. */
+    @SerialName("MaxBendDegrees")
+    var maxBendDegrees: Double = 40.0,
+
+    /** Ground kink that splits the bottom, degrees. */
+    @SerialName("SplitDegrees")
+    var splitDegrees: Double = 3.0,
+
+    /** Pin bend below which two bottom pieces may merge again, degrees. */
+    @SerialName("MergeDegrees")
+    var mergeDegrees: Double = 1.0,
+
+    /** A pin must stay straight and unneeded this long before it merges, seconds. */
+    @SerialName("HoldSeconds")
+    var holdSeconds: Double = 0.5,
+
+    /** Ground farther below the belt than this is not in contact, metres. */
+    @SerialName("ContactBand")
+    var contactBand: Double = 0.15,
+
+    /** Bullet collision margin of every belt body, metres; inside the belt thickness. */
+    @SerialName("CollisionMargin")
+    var collisionMargin: Double = 0.02,
+
+    /** Multiplier on every span's rotational inertia. Statics are unchanged. */
+    @SerialName("UnitInertiaScale")
+    var unitInertiaScale: Double = 1.0,
+
+    /** Bullet updates per physics substep requested while this vehicle exists. */
+    @SerialName("SolverSubsteps")
+    var solverSubsteps: Int = 1,
+
+    /**
+     * Solver iterations per Bullet update requested for the whole world while this
+     * vehicle exists. The belt, the road wheels and the hull form a long joint chain;
+     * the worst pin gap on a slope falls from 49 mm at Bullet's default 10 to 13 mm
+     * at 40 and 7 mm at 60 (TrackedEnvelopeBeltNativeTest). It must be a world-wide
+     * count, never a per-joint override, which leaves friction behind and makes a
+     * parked vehicle creep.
+     */
+    @SerialName("SolverIterations")
+    var solverIterations: Int = 10,
+
+    /**
+     * Belt tension, newtons. The belt does not circulate, so the rear span is not
+     * pinned to the drive wheel: it slides along itself there and this tension
+     * pulls it onto the sprocket, the way the top run's sag keeps a real belt
+     * tight. The lower belt then follows the suspension without moving the idler.
+     */
+    @SerialName("Tension")
+    var tension: Double = 20_000.0,
+
+    /** Viscous damping of that slide, N·s/m. */
+    @SerialName("TensionDamping")
+    var tensionDamping: Double = 8_000.0,
+
+    /** Slide travel each way from the fitted pose, metres. */
+    @SerialName("TensionTravel")
+    var tensionTravel: Double = 0.3,
+
+)
+
+/** Anchor chain parameters. Every value is data so a vehicle never needs code. */
+@Serializable
+data class TrackChainDefinition(
+    /** Bottom unit length in visible link pitches. */
+    @SerialName("UnitPitches")
+    var unitPitches: Double = 2.0,
+
+    /** Bend each pin may make away from its rest angle, degrees. */
+    @SerialName("MaxBendDegrees")
+    var maxBendDegrees: Double = 40.0,
+
+    /** Pieces the top return run is cut into. */
+    @SerialName("TopPieces")
+    var topPieces: Int = 1,
+
+    /**
+     * Collision thickness of bottom units, metres; grows toward the belt interior
+     * so the ground face stays on the belt surface. Null keeps the belt thickness.
+     */
+    @SerialName("BottomCollisionThickness")
+    var bottomCollisionThickness: Double? = null,
+
+    /** Multiplier on every unit's rotational inertia. Statics are unchanged. */
+    @SerialName("UnitInertiaScale")
+    var unitInertiaScale: Double = 1.0,
+
+    /** Bullet updates per physics substep requested while this vehicle exists. */
+    @SerialName("SolverSubsteps")
+    var solverSubsteps: Int = 1,
+)
+
+/** One solid chassis collision box. [size] is half extents, metres. */
+@Serializable
+data class TrackHullBoxDefinition(
+    @SerialName("Size")
+    var size: SerializedVec3 = Vec3.ZERO,
+
+    @SerialName("Position")
+    var position: SerializedVec3 = Vec3.ZERO,
+
+    /** Degrees, applied Y then X then Z like the vehicle OBB `CustomRotate`. */
+    @SerialName("Rotation")
+    var rotation: SerializedVec3 = Vec3.ZERO,
 )
 
 /** One side's running gear and its own link template. */
@@ -164,6 +329,26 @@ data class TrackSideDefinition(
 
     @SerialName("Wheels")
     var wheels: MutableList<TrackWheelDefinition> = mutableListOf(),
+
+    /**
+     * Optional bone whose cubes mark the belt envelope reference points.
+     *
+     * Each cube centre is one anchor on the belt centre line. Anchors are not
+     * fixed: every anchor follows the wheel it is closest to, so the reference
+     * envelope moves with suspension and tension. The bone itself is a marker and
+     * is never rendered.
+     */
+    @SerialName("EnvelopeAnchorBone")
+    var envelopeAnchorBone: String? = null,
+
+    /**
+     * When true every wheel body is centred laterally on the belt plane taken
+     * from [linkTemplateBone], instead of on its own bone pivot. Use it when a
+     * wheel bone's pivot is not on the visible disc (for example an arm pivot).
+     * The bone offset is kept for rendering only.
+     */
+    @SerialName("AlignWheelsToBelt")
+    var alignWheelsToBelt: Boolean = false,
 )
 
 /**

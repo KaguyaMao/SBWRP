@@ -280,7 +280,8 @@ open class TurretWreckEntity(type: EntityType<TurretWreckEntity>, level: Level) 
     }
 
     open fun generateWreckageLoot() {
-        val data = WreckageLootDataManager.getLootData(ResourceLocation(this.vehicleName)) ?: return
+        val id = ResourceLocation.tryParse(this.vehicleName) ?: return
+        val data = WreckageLootDataManager.getLootData(id) ?: return
         val pools = data.pools
         if (pools.isEmpty()) return
         pools.forEach { pool ->

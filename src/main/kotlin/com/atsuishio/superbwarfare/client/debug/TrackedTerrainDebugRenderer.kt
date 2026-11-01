@@ -42,7 +42,13 @@ object TrackedTerrainDebugRenderer {
         poseStack.pushPose()
         poseStack.translate(-camera.x, -camera.y, -camera.z)
         TrackedTerrainDebugClient.forEach { mesh -> draw(poseStack, lines, mesh) }
-        TrackedTerrainDebugClient.forEachShape { shape -> drawShape(poseStack, lines, shape) }
+        val partialTick = event.partialTick
+        val level = mc.level
+        TrackedTerrainDebugClient.forEachShape { shape ->
+            val vehicle = level?.getEntity(shape.entityId)
+                as? com.atsuishio.superbwarfare.entity.vehicle.base.VehicleEntity ?: return@forEachShape
+            drawShape(poseStack, lines, shape, vehicle.getVehicleTransform(partialTick))
+        }
         poseStack.popPose()
         buffer.endBatch(RenderType.lines())
     }
@@ -92,30 +98,49 @@ object TrackedTerrainDebugRenderer {
     }
 
     /**
-     * Hull OBBs are yellow, wheel cylinders white, run boxes green.
+     * Hull boxes are yellow, wheel cylinders white, run boxes green, turret and
+     * barrel blue.
      *
-     * These are the shapes installed in Bullet, drawn from the same pose the
-     * physics thread published. They are not the entity hurtbox.
+     * These are the shapes installed in Bullet, relative to the chassis body.
+     * They are placed with the vehicle's interpolated render transform, so they
+     * move with the drawn model. They are not the entity hurtbox.
      */
     private fun drawShape(
         poseStack: PoseStack,
         lines: VertexConsumer,
         shape: TrackedTerrainDebugClient.ShapeView,
+        transform: org.joml.Matrix4d,
     ) {
         val width = TrackedCollisionDebug.FLOATS_PER_SEGMENT
         val values = shape.segments
+        val origin = shape.origin
+        val a = org.joml.Vector3d()
+        val b = org.joml.Vector3d()
         var cursor = 0
         while (cursor + width <= values.size) {
             val kind = values[cursor + 6]
             val color = when {
+                kind > 3.5f -> floatArrayOf(0.35f, 0.6f, 1f)
                 kind > 2.5f -> floatArrayOf(0.2f, 0.95f, 0.35f)
                 kind > 1.5f -> floatArrayOf(0.92f, 0.92f, 0.95f)
                 else -> floatArrayOf(1f, 0.86f, 0.15f)
             }
+            a.set(
+                (origin[0] + values[cursor]).toDouble(),
+                (origin[1] + values[cursor + 1]).toDouble(),
+                (origin[2] + values[cursor + 2]).toDouble(),
+            )
+            b.set(
+                (origin[0] + values[cursor + 3]).toDouble(),
+                (origin[1] + values[cursor + 4]).toDouble(),
+                (origin[2] + values[cursor + 5]).toDouble(),
+            )
+            transform.transformPosition(a)
+            transform.transformPosition(b)
             edge(
                 poseStack, lines,
-                values[cursor], values[cursor + 1], values[cursor + 2],
-                values[cursor + 3], values[cursor + 4], values[cursor + 5],
+                a.x.toFloat(), a.y.toFloat(), a.z.toFloat(),
+                b.x.toFloat(), b.y.toFloat(), b.z.toFloat(),
                 color,
             )
             cursor += width

@@ -408,8 +408,13 @@ class TrackedTerrainMeshPlannerTest {
         )
     }
 
+    /**
+     * Two ramps climbing toward each other across a narrow gap meet along a
+     * continuous crease: the surface is the higher of the two everywhere, so
+     * there is no hump in the middle and no wall left at either riser.
+     */
     @Test
-    fun crossingRampsKeepTheLowerSurfaceInsteadOfPenetrating() {
+    fun crossingRampsJoinAlongTheUpperEnvelope() {
         val boxes = ArrayList<TerrainBox>()
         for (x in listOf(0, 2, 3, 5, 6)) boxes += box(x, 0, 0, x + 1, 1, 1)
         boxes += box(1, 0, 0, 2, 2, 1)
@@ -425,24 +430,126 @@ class TrackedTerrainMeshPlannerTest {
         val east = plan.ramps.filter { it.direction == RampDirection.EAST && it.highX in 3.5..4.5 }
         val west = plan.ramps.filter { it.direction == RampDirection.WEST && it.highX in 1.5..2.5 }
         assertTrue(east.isNotEmpty() && west.isNotEmpty(), "both climbs must remain: ${plan.ramps}")
-        var eastOwned = false
-        var westOwned = false
         var x = 2.125
         while (x < 3.9) {
-            val eastHeight = east.minOf { rampHeight(it, x) }
-            val westHeight = west.minOf { rampHeight(it, x) }
-            val lower = minOf(eastHeight, westHeight)
+            val upper = maxOf(east.maxOf { rampHeight(it, x) }, west.maxOf { rampHeight(it, x) })
             val heights = rampTriangleHeights(plan, x, 0.5)
             assertTrue(heights.isNotEmpty(), "the overlap at x=$x must still have a surface")
             assertTrue(
-                heights.all { it <= lower + 0.08 },
-                "a crossing ramp must not stay above the lower surface at x=$x: $heights lower=$lower",
+                heights.all { kotlin.math.abs(it - upper) < 0.03 },
+                "the surface must follow the upper envelope at x=$x: $heights upper=$upper",
             )
-            if (heights.any { kotlin.math.abs(it - eastHeight) < 0.08 }) eastOwned = true
-            if (heights.any { kotlin.math.abs(it - westHeight) < 0.08 }) westOwned = true
             x += 0.25
         }
-        assertTrue(eastOwned && westOwned, "each climb must keep the side where it is the lower surface")
+        assertFalse(hasVerticalQuadAtX(plan, 2.0, 1.0), "the west riser is covered by its ramp")
+        assertFalse(hasVerticalQuadAtX(plan, 4.0, -1.0), "the east riser is covered by its ramp")
+    }
+
+    /**
+     * A raised block approached from two perpendicular sides gets one ramp per
+     * face, and an elliptic cone in each outside corner joins them. Along the
+     * cone's edges its height equals the adjacent strip, so the slope is
+     * continuous all the way around the corner.
+     */
+    @Test
+    fun perpendicularRampsAreJoinedAroundAnOutsideCorner() {
+        val boxes = ArrayList<TerrainBox>()
+        for (x in 0..7) for (z in 0..7) boxes += box(x, 0, z, x + 1, 1, z + 1)
+        for (x in 3..4) for (z in 3..4) boxes += box(x, 1, z, x + 1, 2, z + 1)
+        val plan = TrackedTerrainMeshPlanner.build(
+            boxes = boxes,
+            terrain = terrain.copy(stepM = 2.0),
+            originX = 0.0,
+            originY = 0.0,
+            originZ = 0.0,
+            contentHash = 21L,
+        )
+        assertEquals(4, plan.ramps.map { it.direction }.toSet().size, "all four faces ramp without a gate")
+        assertEquals(4, plan.cornerPatchCount, "every outside corner is joined: ${plan.ramps}")
+        // Walk around the north-west corner (3, 3) on a quarter circle of radius 1.
+        val heights = (0..8).map { step ->
+            val angle = Math.PI + step * Math.PI / 16.0
+            val x = 3.0 + kotlin.math.cos(angle) * 0.999
+            val z = 3.0 + kotlin.math.sin(angle) * 0.999
+            val found = rampTriangleHeights(plan, x, z)
+            assertTrue(found.isNotEmpty(), "corner surface missing at ($x, $z)")
+            found.max()
+        }
+        for (height in heights) assertEquals(1.5, height, 0.05, "the corner cone keeps the slope height: $heights")
+        // The cone meets the floor at its rim and the block top at the corner.
+        assertTrue(rampTriangleHeights(plan, 2.99, 2.99).all { it > 1.95 })
+    }
+
+    /** A full 99A window (24 x 24 blocks, steps everywhere) must plan quickly off-thread. */
+    @Test
+    fun aFullWindowPlansInBoundedTime() {
+        val random = java.util.Random(99)
+        val boxes = ArrayList<TerrainBox>()
+        for (x in -12 until 12) for (z in -12 until 12) {
+            boxes += box(x, -3, z, x + 1, 0, z + 1)
+            val extra = if (random.nextInt(4) == 0) 1 + random.nextInt(2) else 0
+            for (level in 0 until extra) boxes += box(x, level, z, x + 1, level + 1, z + 1)
+        }
+        val policy = terrain.copy(stepM = 3.0)
+        TrackedTerrainMeshPlanner.build(boxes, policy, -12.0, -3.0, -12.0, 1L)
+        val started = System.nanoTime()
+        val plan = TrackedTerrainMeshPlanner.build(boxes, policy, -12.0, -3.0, -12.0, 2L)
+        val millis = (System.nanoTime() - started) / 1_000_000.0
+        println("full window: boxes=${boxes.size} ramps=${plan.ramps.size} corners=${plan.cornerPatchCount} tris=${plan.triangleCount} ${"%.1f".format(millis)} ms")
+        assertTrue(millis < 2_000.0, "planning took $millis ms")
+    }
+
+    /** Superflat-like ground: several solid layers under the whole window, plus a stone pad. */
+    @Test
+    fun solidLayersUnderTheWholeWindowPlanCheaply() {
+        val boxes = ArrayList<TerrainBox>()
+        for (x in -12 until 12) for (z in -12 until 12) for (y in -4 until 0) boxes += box(x, y, z, x + 1, y + 1, z + 1)
+        for (x in -5..5) for (z in -10..10) boxes += box(x, 0, z, x + 1, 1, z + 1)
+        val policy = terrain.copy(stepM = 3.0)
+        TrackedTerrainMeshPlanner.build(boxes, policy, -12.0, -5.0, -12.0, 1L)
+        val warm = System.nanoTime()
+        val plan = TrackedTerrainMeshPlanner.build(boxes, policy, -12.0, -5.0, -12.0, 2L)
+        val ms = (System.nanoTime() - warm) / 1_000_000.0
+        println("solid layers: boxes=${boxes.size} tris=${plan.triangleCount} ramps=${plan.ramps.size} ${"%.1f".format(ms)} ms")
+        assertTrue(ms < 150.0, "planning took $ms ms")
+    }
+
+    /** The GameTest layout: a small stone floor in void, with the 99A look-ahead policy. */
+    @Test
+    fun aSmallFloorInVoidPlansCheaply() {
+        val boxes = ArrayList<TerrainBox>()
+        for (x in -5..5) for (z in -10..10) boxes += box(x, 0, z, x + 1, 1, z + 1)
+        val policy = terrain.copy(stepM = 3.0)
+        val cold = System.nanoTime()
+        TrackedTerrainMeshPlanner.build(boxes, policy, -12.0, -3.0, -12.0, 1L)
+        val coldMs = (System.nanoTime() - cold) / 1_000_000.0
+        val warm = System.nanoTime()
+        repeat(20) { TrackedTerrainMeshPlanner.build(boxes, policy, -12.0, -3.0, -12.0, 2L) }
+        val warmMs = (System.nanoTime() - warm) / 20_000_000.0
+        println("small floor: boxes=${boxes.size} cold=${"%.1f".format(coldMs)} ms warm=${"%.1f".format(warmMs)} ms")
+        assertTrue(warmMs < 200.0)
+    }
+
+    @Test
+    fun anObliqueHeadingRampsBothAxesAndASquareHeadingOnlyOne() {
+        val square = RampGate.forVehicle(0.0, 0.0, 0.0, 1.0, 50.0)
+        assertTrue(square.allows(RampDirection.SOUTH, 4.0, 0))
+        assertFalse(square.allows(RampDirection.EAST, 4.0, 0), "a rise beside the hull stays a wall")
+        val oblique = RampGate.forVehicle(0.0, 0.0, kotlin.math.sin(Math.toRadians(30.0)), kotlin.math.cos(Math.toRadians(30.0)), 50.0)
+        assertTrue(oblique.allows(RampDirection.SOUTH, 4.0, 0))
+        assertTrue(oblique.allows(RampDirection.EAST, 4.0, 0), "60 degrees off the axis still ramps")
+    }
+
+    @Test
+    fun theHeadingBucketHasHysteresis() {
+        val bucket = RampGate.bucketOf(0.0, 1.0)
+        val nearBoundary = Math.toRadians(90.0 - 17.0)
+        val x = kotlin.math.cos(nearBoundary)
+        val z = kotlin.math.sin(nearBoundary)
+        assertTrue(RampGate.bucketOf(x, z) != bucket, "17 degrees off is past the plain boundary")
+        assertEquals(bucket, RampGate.bucketWithHysteresis(x, z, bucket), "but inside the hysteresis band")
+        val far = Math.toRadians(90.0 - 25.0)
+        assertTrue(RampGate.bucketWithHysteresis(kotlin.math.cos(far), kotlin.math.sin(far), bucket) != bucket)
     }
 
     @Test
@@ -462,34 +569,6 @@ class TrackedTerrainMeshPlannerTest {
         )
         assertTrue(plan.ramps.any { it.lowY < 2.0 }, "the ground ramp must remain: ${plan.ramps}")
         assertTrue(plan.ramps.any { it.lowY > 5.0 }, "the deck ramp is another layer and must remain: ${plan.ramps}")
-    }
-
-    @Test
-    fun aRampThroughTheGearIsRefusedButAWheelRestingOnItIsNot() {
-        val cutting = GearProbe(2.5, 1.5, 1.0, 0.35, 0.3, 0.35)
-        val cut = TrackedTerrainMeshPlanner.build(
-            boxes = floorAndStep(),
-            terrain = terrain,
-            originX = 0.0,
-            originY = 0.0,
-            originZ = 0.0,
-            contentHash = 18L,
-            gear = listOf(cutting),
-        )
-        assertTrue(cut.ramps.isEmpty(), "a ramp through the gear centre must stay a wall: ${cut.ramps}")
-        assertTrue(cut.wallQuadCount > 0, "refusing the ramp must leave the riser")
-
-        val resting = GearProbe(2.15, 1.35, 1.0, 0.35, 0.3, 0.35)
-        val kept = TrackedTerrainMeshPlanner.build(
-            boxes = floorAndStep(),
-            terrain = terrain,
-            originX = 0.0,
-            originY = 0.0,
-            originZ = 0.0,
-            contentHash = 19L,
-            gear = listOf(resting),
-        )
-        assertEquals(1, kept.ramps.size, "a wheel sitting on the foot must not delete the ramp")
     }
 
     private fun rampHeight(ramp: TerrainRampPlan, x: Double): Double {

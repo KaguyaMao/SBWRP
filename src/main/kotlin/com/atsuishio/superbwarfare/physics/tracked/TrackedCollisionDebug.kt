@@ -7,11 +7,17 @@ import kotlin.math.cos
 import kotlin.math.sin
 
 /**
- * World-space edges of the collision shapes a tracked vehicle actually has.
+ * Edges of the collision shapes a tracked vehicle actually has, in the chassis
+ * body frame.
  *
  * This is display data. It is built from the physics-thread pose and the
  * compiled shape, then copied out as plain floats. A renderer must not turn
  * it back into a body, and reading it must not wake or move anything.
+ *
+ * The edges are chassis-local on purpose. The client draws them through the
+ * same interpolated vehicle transform as the model, with [Snapshot.originX]..
+ * as the body origin in the vehicle data frame, so the wireframe stays on the
+ * rendered vehicle instead of lagging or leading it in world space.
  */
 object TrackedCollisionDebug {
     const val FLOATS_PER_SEGMENT = 8
@@ -20,11 +26,16 @@ object TrackedCollisionDebug {
     const val KIND_HULL = 1f
     const val KIND_WHEEL = 2f
     const val KIND_RUN = 3f
+    const val KIND_ARTICULATION = 4f
 
     class Snapshot(
         val epoch: Long,
         val segments: FloatArray,
         val truncated: Boolean,
+        /** Chassis body origin in the vehicle data frame, metres. */
+        val originX: Float = 0f,
+        val originY: Float = 0f,
+        val originZ: Float = 0f,
     ) {
         val segmentCount: Int get() = segments.size / FLOATS_PER_SEGMENT
     }

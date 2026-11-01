@@ -46,8 +46,8 @@ class VehicleMassPlanTest {
         assertTrue(plan.problems.isEmpty(), "plan problems: ${plan.problems}")
         assertTrue(plan.closes(), "allocated ${plan.allocatedMassKg} != authored ${plan.totalMassKg}")
         assertEquals(12_400f, plan.wheelMassKg, 1f, "wheel ends keep authored mass")
-        assertEquals(2_844f, plan.runMassKg, 1f, "run budget is the old shoe budget, both sides")
-        assertEquals(39_756f, plan.chassisMassKg, 1f, "hull is the remaining sprung assembly")
+        assertEquals(11_376f, plan.runMassKg, 1f, "run budget: 5688 kg per side (belt units carry four times the old shoe budget)")
+        assertEquals(31_224f, plan.chassisMassKg, 1f, "hull is the remaining sprung assembly")
         assertEquals(0f, plan.turretMassKg, 0f)
         assertEquals(0f, plan.barrelMassKg, 0f)
         assertTrue(abs(plan.allocatedMassKg - 55_000f) <= VehicleMassPlan.TOLERANCE_KG)
@@ -75,7 +75,7 @@ class VehicleMassPlanTest {
         assertTrue(plan.turretMassKg > 0f, "a turret must take a share of the sprung assembly")
         assertEquals(0f, plan.barrelMassKg, 0f)
         assertEquals(
-            39_756f,
+            31_224f,
             plan.chassisMassKg + plan.turretMassKg,
             1f,
             "chassis + turret must still equal the sprung assembly",

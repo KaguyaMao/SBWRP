@@ -58,12 +58,12 @@ class TrackedVehicleAuditTest {
     @Test
     fun theAuthoredDataAndModelHashesAreTheAuditedOnes() {
         assertEquals(
-            "f375e73ba3376eb405523db05cdf4219fac5c3235575ed3226db042387c81e72",
+            "3da2fb4f039a11d8f83aeaf851c41d3131d07212405f13ad1f1218517723c168",
             sha256(definitionFile.readText()),
             "99A mechanism JSON changed; re-audit before reusing the old numbers",
         )
         assertEquals(
-            "5809b45cc3bd3121ce439aaa6cab5e7113623f18ef30d849692205c90f1df369",
+            "7de5f12e9e41f97ffce18b3fdc5529c0feaed41c4fb61ac50db8117816d9d51d",
             sha256(modelFile.readText()),
             "99A model JSON changed; re-audit before reusing the old numbers",
         )
@@ -127,9 +127,16 @@ class TrackedVehicleAuditTest {
             }
             assertNotNull(compiled, "no compiled ${wheel.side} ${wheel.role} wheel near ${wheel.position}")
             val centre = compiled!!
+            // The body is centred on the belt plane; the bone pivot is kept as a
+            // render offset, so body + offset must still be the authored pivot.
+            val pivotX = centre.bindCenter.x + centre.renderOffset.x
             assertTrue(
-                abs(centre.bindCenter.x - (wheel.position[0] - origin.x)) < 2e-3,
-                "${centre.bone} x ${centre.bindCenter.x} vs ${wheel.position[0] - origin.x}",
+                abs(pivotX - (wheel.position[0] - origin.x)) < 2e-3,
+                "${centre.bone} pivot x $pivotX vs ${wheel.position[0] - origin.x}",
+            )
+            assertEquals(
+                spec.side(wheel.side).belt.centerPlaneX, centre.bindCenter.x, 1e-9,
+                "${centre.bone} body must sit on the belt plane",
             )
             assertEquals(wheel.radius, centre.radius, 1e-6, "${centre.bone} radius")
             assertEquals(wheel.width, centre.halfWidth, 1e-6, "${centre.bone} half width")
@@ -245,10 +252,10 @@ class TrackedVehicleAuditTest {
 
         assertEquals(8, spec.side(TrackedSide.LEFT).runs.size, "physical runs per side")
         assertEquals(16, physical, "physical runs, both sides")
-        assertEquals(37, spec.renders.getValue(TrackedSide.LEFT).visibleBones.size, "visible track bones per side")
-        assertEquals(37, spec.renders.getValue(TrackedSide.RIGHT).visibleBones.size, "visible track bones per side")
+        assertEquals(1, spec.renders.getValue(TrackedSide.LEFT).visibleBones.size, "visible track bones per side")
+        assertEquals(1, spec.renders.getValue(TrackedSide.RIGHT).visibleBones.size, "visible track bones per side")
         assertTrue(skeleton > visible, "model bones must exceed the visible track subset")
-        assertEquals(287, skeleton, "99A model bone count")
+        assertEquals(141, skeleton, "99A model bone count")
         println("physical=$physical visible=$visible skeleton=$skeleton")
 
         assertTrue(physical != visible, "physical and visible link counts must not be assumed equal")
@@ -290,6 +297,54 @@ class TrackedVehicleAuditTest {
         ).kind)
     }
 
+    /**
+     * The six PointL/PointR marker cubes become ordered belt anchors. Each one
+     * follows the wheel whose belt centre-line circle is nearest.
+     */
+    @Test
+    fun envelopeAnchorsComeFromTheMarkerBone() {
+        val spec = spec()
+        for (side in TrackedSide.entries) {
+            val compiled = spec.side(side)
+            val anchors = compiled.anchors
+            assertEquals(6, anchors.size, "$side anchors")
+            val owners = anchors.map { compiled.wheels[it.ownerWheel] }
+            assertEquals(2, owners.count { it.role == TrackWheelRole.IDLER_GUIDE }, "$side idler anchors")
+            assertEquals(2, owners.count { it.role == TrackWheelRole.DRIVE_GUIDE }, "$side drive anchors")
+            val road = owners.filter { it.isSuspended }.map { it.bone }.toSet()
+            assertEquals(setOf("wheel${side.name.first()}1", "wheel${side.name.first()}6"), road, "$side bottom anchors")
+            assertTrue(anchors.zipWithNext().all { (a, b) -> a.pathDistance <= b.pathDistance }, "$side anchor order")
+            for (anchor in anchors) {
+                assertEquals(compiled.belt.centerPlaneX, anchor.bindPoint.x, 1e-9)
+                assertTrue(abs(anchor.radialErrorM) < 0.2, "$side anchor ${anchor.ordinal} radial ${anchor.radialErrorM}")
+            }
+            assertEquals(listOf("Point${side.name.first()}"), spec.renders.getValue(side).hiddenBones)
+        }
+    }
+
+    /**
+     * The physics hull leaves the running gear free. The gameplay OBB that
+     * encloses the tracks (half width 2.25 m) must be rejected.
+     */
+    @Test
+    fun theHullCollisionLeavesTheRunningGearFree() {
+        val spec = spec()
+        assertEquals(5, spec.hullBoxes.size, "99A authors its physics hull")
+        assertTrue(TrackedHullAudit.audit(spec.hullBoxes, spec.sides.values).isEmpty())
+
+        val enclosing = definition().also {
+            it.hullCollision = mutableListOf(
+                TrackHullBoxDefinition(
+                    size = net.minecraft.world.phys.Vec3(2.25, 0.813, 1.531),
+                    position = net.minecraft.world.phys.Vec3(0.0, 1.438, -2.906),
+                ),
+            )
+        }
+        val result = TrackedVehicleCompiler.compile("superbwarfare:ztz_99a", enclosing, modelFile.readText())
+        assertNull(result.spec, "a hull box enclosing the belt must not compile")
+        assertTrue(result.findings.any { it.code == "hull.running-gear" })
+    }
+
     /** The belt plane comes from the template pivot, not from the wheel hubs. */
     @Test
     fun theBeltPlaneComesFromTheTemplatePivot() {
@@ -297,11 +352,14 @@ class TrackedVehicleAuditTest {
         for (side in TrackedSide.entries) {
             val compiled = spec.side(side)
             val centreX = compiled.belt.centerPlaneX
-            val hubMean = compiled.wheels.map { it.bindCenter.x }.average()
+            val pivotMean = compiled.wheels.map { it.bindCenter.x + it.renderOffset.x }.average()
             assertTrue(
-                abs(centreX - hubMean) > 0.05,
-                "$side belt plane must not be the wheel-hub mean",
+                abs(centreX - pivotMean) > 0.05,
+                "$side belt plane must not be the wheel-bone pivot mean",
             )
+            for (wheel in compiled.wheels) {
+                assertEquals(centreX, wheel.bindCenter.x, 1e-9, "${wheel.bone} is aligned to the belt plane")
+            }
             for (run in compiled.runs) {
                 assertEquals(centreX, run.center.x, 1e-9, "run ${run.index} lateral centre")
             }

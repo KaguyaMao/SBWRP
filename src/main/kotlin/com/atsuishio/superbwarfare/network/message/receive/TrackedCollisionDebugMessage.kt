@@ -9,8 +9,9 @@ import net.minecraft.network.FriendlyByteBuf
 /**
  * One chunk of collision-shape edges for a tracked vehicle.
  *
- * The edges are already in world coordinates. They are the hull OBBs, wheel
- * cylinders and run boxes that were installed, not a second collision shape.
+ * The edges are in the chassis body frame; [originX].. is that body's origin in
+ * the vehicle data frame. They are the hull, articulation, wheel and run shapes
+ * that were installed, not a second collision shape.
  */
 class TrackedCollisionDebugMessage(
     val entityId: Int,
@@ -20,6 +21,9 @@ class TrackedCollisionDebugMessage(
     val chunkCount: Int,
     val truncated: Boolean,
     val segments: FloatArray,
+    val originX: Float = 0f,
+    val originY: Float = 0f,
+    val originZ: Float = 0f,
 ) : ClientPacketPayload() {
 
     fun writeTo(buf: FriendlyByteBuf) {
@@ -30,6 +34,9 @@ class TrackedCollisionDebugMessage(
         buf.writeVarInt(chunkIndex)
         buf.writeVarInt(chunkCount)
         buf.writeBoolean(truncated)
+        buf.writeFloat(originX)
+        buf.writeFloat(originY)
+        buf.writeFloat(originZ)
         buf.writeVarInt(segments.size / TrackedCollisionDebug.FLOATS_PER_SEGMENT)
         for (value in segments) buf.writeFloat(value)
     }
@@ -50,6 +57,7 @@ class TrackedCollisionDebugMessage(
                 return listOf(
                     TrackedCollisionDebugMessage(
                         entityId, false, snapshot.epoch, 0, 1, snapshot.truncated, FloatArray(0),
+                        snapshot.originX, snapshot.originY, snapshot.originZ,
                     ),
                 )
             }
@@ -66,6 +74,9 @@ class TrackedCollisionDebugMessage(
                     chunkCount = chunks,
                     truncated = snapshot.truncated,
                     segments = snapshot.segments.copyOfRange(start * width, end * width),
+                    originX = snapshot.originX,
+                    originY = snapshot.originY,
+                    originZ = snapshot.originZ,
                 )
             }
         }
@@ -79,11 +90,15 @@ class TrackedCollisionDebugMessage(
             val chunkIndex = buf.readVarInt()
             val chunkCount = buf.readVarInt()
             val truncated = buf.readBoolean()
+            val originX = buf.readFloat()
+            val originY = buf.readFloat()
+            val originZ = buf.readFloat()
             val count = buf.readVarInt().coerceIn(0, TrackedCollisionDebug.CHUNK_SEGMENTS)
             val segments = FloatArray(count * TrackedCollisionDebug.FLOATS_PER_SEGMENT)
             for (index in segments.indices) segments[index] = buf.readFloat()
             return TrackedCollisionDebugMessage(
                 entityId, false, epoch, chunkIndex, chunkCount, truncated, segments,
+                originX, originY, originZ,
             )
         }
     }

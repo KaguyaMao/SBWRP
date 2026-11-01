@@ -27,7 +27,7 @@ internal object TrackedBeltRenderer {
     private val legacyRings = arrayOf("ring_l", "ring_l2", "ring_r", "ring_r2")
 
     fun prepare(instance: VehicleModelInstance, tracked: TrackedRenderState) {
-        hideLegacy(instance)
+        hideLegacy(instance, tracked)
         placeWheels(instance, tracked)
     }
 
@@ -44,7 +44,14 @@ internal object TrackedBeltRenderer {
         drawSide(instance, poseStack, consumer, packedLight, tracked, tracked.right)
     }
 
-    private fun hideLegacy(instance: VehicleModelInstance) {
+    /** Hide compile-only marker bones, such as belt envelope anchors. */
+    fun hideMarkers(instance: VehicleModelInstance, names: Iterable<String>) {
+        for (name in names) instance.getBone(name)?.visible = false
+    }
+
+    private fun hideLegacy(instance: VehicleModelInstance, tracked: TrackedRenderState) {
+        hideMarkers(instance, tracked.left.hiddenBones)
+        hideMarkers(instance, tracked.right.hiddenBones)
         for (name in legacyRings) instance.getBone(name)?.visible = false
         val groups = instance.boneGroups
         sequenceOf(
@@ -64,7 +71,10 @@ internal object TrackedBeltRenderer {
     ) {
         for (wheel in side.wheels) {
             val bone = instance.getBone(wheel.bone) ?: continue
-            place(instance, bone, tracked, wheel.x, wheel.y, wheel.z)
+            place(
+                instance, bone, tracked,
+                wheel.x + wheel.boneOffsetX, wheel.y + wheel.boneOffsetY, wheel.z + wheel.boneOffsetZ,
+            )
             bone.rotation.rotationX(wheel.spin.toFloat())
         }
     }
@@ -78,9 +88,13 @@ internal object TrackedBeltRenderer {
         side: TrackedSideRenderState,
     ) {
         if (side.visibleCount <= 0 || side.restPitch <= 1.0e-6 || side.templateBone.isBlank() || side.wheels.size < 2) return
-        val path = McspTrackPath.solve(side.wheels.map {
+        val envelope = McspTrackPath.solve(side.wheels.map {
             McspTrackPath.Wheel(it.y, it.z, it.radius, it.outside)
-        }, side.thickness) ?: return
+        }, side.thickness)
+        // The physical belt is the anchor chain when its pins are published:
+        // plates then lie on the same polyline the dynamic belt bodies form.
+        val physical = McspTrackPath.polyline(side.beltY, side.beltZ, envelope)
+        val path = physical ?: envelope ?: return
         val link = instance.getBone(side.templateBone) ?: return
         val move = instance.getBone(link.parentIndex()) ?: link
         val boneIndex = instance.getIndex(side.templateBone)
@@ -93,7 +107,9 @@ internal object TrackedBeltRenderer {
         // move the idler or freeze the scroll.
         val spacing = path.length / side.visibleCount
         val travel = side.phase * spacing
-        val seatNormal = seatOnRoadWheels(path, side)
+        // Pins are already the belt centre line; only the envelope needs the
+        // road-wheel seat correction.
+        val seatNormal = if (physical != null) side.seatNormal else seatOnRoadWheels(path, side)
         for (plate in 0 until side.visibleCount) {
             val sample = path.at(travel + plate * spacing)
             val pose = McspTrackPath.linkPose(sample, side.seatAlong, seatNormal, side.seatAngle)

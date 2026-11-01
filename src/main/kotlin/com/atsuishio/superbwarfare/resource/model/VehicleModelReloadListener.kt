@@ -17,6 +17,9 @@ object VehicleModelReloadListener : BasicModelReloadListener("vehicle") {
         "^flare.*",     // flare bones
         "^laser.*",     // laser bones
         "^wheel[LR].*", // alternative wheel naming
+        "^lead[LR]$",   // tracked drive sprockets
+        "^follow[LR]$", // tracked idlers
+        "^Point[LR]$",  // tracked belt envelope anchor markers (hidden)
         "^track.*",     // track bones
         "^shell.*",     // shell bones
         "^.*_dogTag_(?<w>\\d+)x(?<h>\\d+)$",

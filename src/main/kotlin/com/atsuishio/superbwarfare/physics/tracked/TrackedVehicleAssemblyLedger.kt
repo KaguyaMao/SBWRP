@@ -49,6 +49,19 @@ internal class TrackedVehicleAssemblyLedger(private val level: PhysicsLevel) {
         synchronized(lock) { bodies += body }
     }
 
+    /**
+     * Forget a joint the caller has already removed from the world. Used by the
+     * dynamic belt, whose bodies and joints come and go while the vehicle lives.
+     */
+    fun releaseJoint(joint: New6Dof) {
+        synchronized(lock) { joints.removeAll { it === joint } }
+    }
+
+    /** Forget a body the caller has already removed from the world. */
+    fun releaseBody(body: PhysicsRigidBody) {
+        synchronized(lock) { bodies.removeAll { it === body } }
+    }
+
     /** Record a run runtime before its own `create()` is submitted. */
     fun recordRuntime(runtime: TrackRunRuntime) {
         synchronized(lock) { runtimes += runtime }

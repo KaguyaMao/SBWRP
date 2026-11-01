@@ -48,35 +48,89 @@ object TrackedTerrainSampler {
     private const val ENVELOPE_MARGIN = 0.25
 
     /**
-     * World-space region to sample for a vehicle centred at [center].
+     * Clear ground ahead of the longest generated ramp, metres.
      *
-     * The horizontal extent is the compiled running-gear envelope plus a
-     * replacement margin, bounded by the authored `WindowRadius`. The vertical
-     * extent covers the authored band and the whole envelope, so a bridge deck
-     * above the hull and a pit below it are both inside the region.
+     * A ramp of length `Step` must already be in the installed mesh before the
+     * first wheel reaches its foot. The window therefore reaches `Step` plus this
+     * margin beyond the running gear in every horizontal direction.
      */
-    fun window(center: Vec3, envelope: TerrainEnvelope, terrain: CompiledTerrain): AABB {
-        // A rotation-independent disk bound avoids rebuilding on every turn while
-        // still containing every yawed wheel and run. Snap the center, not the
-        // boundaries: half a grid cell is included in the required radius so the
-        // window stays fixed while the chassis moves inside that center cell.
-        val limit = terrain.windowRadiusBlocks.toDouble()
+    const val RAMP_LOOKAHEAD = 1.0
+
+    /** Horizontal travel from the window centre that requests a new mesh, metres. */
+    const val REBUILD_DISTANCE = 2.0
+
+    /** Vertical travel from the window centre that requests a new mesh, metres. */
+    const val REBUILD_HEIGHT = 1.0
+
+    /**
+     * Slack built into the window radius, metres.
+     *
+     * The installed mesh keeps covering the running gear and the ramp look-ahead
+     * until the vehicle has moved this far from the window centre. Rebuilding is
+     * requested at [REBUILD_DISTANCE], so the replacement has the difference to
+     * arrive while the vehicle keeps driving on the old mesh.
+     */
+    const val COVER_DISTANCE = 3.0
+
+    /** Vertical slack built into the window, metres; see [COVER_DISTANCE]. */
+    const val COVER_HEIGHT = 1.5
+
+    /** Window centre for a vehicle at [center], snapped to the block grid. */
+    fun snap(center: Vec3): Vec3 = Vec3(snapCenter(center.x), snapCenter(center.y), snapCenter(center.z))
+
+    /** True while a window centred at [windowCenter] still covers a vehicle at [center]. */
+    fun covers(windowCenter: Vec3, center: Vec3): Boolean =
+        hypot(center.x - windowCenter.x, center.z - windowCenter.z) <= COVER_DISTANCE &&
+            abs(center.y - windowCenter.y) <= COVER_HEIGHT
+
+    /** True when a vehicle at [center] has moved far enough to want a new window. */
+    fun wantsRebuild(windowCenter: Vec3, center: Vec3): Boolean =
+        hypot(center.x - windowCenter.x, center.z - windowCenter.z) > REBUILD_DISTANCE ||
+            abs(center.y - windowCenter.y) > REBUILD_HEIGHT
+
+    /** Horizontal radius of every window for this envelope and policy, metres. */
+    fun radius(envelope: TerrainEnvelope, terrain: CompiledTerrain): Double {
         val radialX = maxOf(abs(envelope.minX), abs(envelope.maxX))
         val radialZ = maxOf(abs(envelope.minZ), abs(envelope.maxZ))
-        val radius = hypot(radialX, radialZ) + ENVELOPE_MARGIN + WINDOW_GRID_BLOCKS * 0.5
-        val halfBelow = maxOf(terrain.verticalBelowBlocks.toDouble(), -envelope.minY + 1.0) + WINDOW_GRID_BLOCKS * .5
-        val halfAbove = maxOf(terrain.verticalAboveBlocks.toDouble(), envelope.maxY + 1.0) + WINDOW_GRID_BLOCKS * .5
+        val lookahead = if (terrain.rampsEnabled) terrain.stepM + RAMP_LOOKAHEAD else 0.0
+        return hypot(radialX, radialZ + lookahead) + ENVELOPE_MARGIN + COVER_DISTANCE
+    }
+
+    /**
+     * World-space region to sample for a window centred at [windowCenter].
+     *
+     * The horizontal extent is the compiled running-gear envelope, plus the
+     * ramp look-ahead, plus [COVER_DISTANCE] of slack, bounded by the authored
+     * `WindowRadius`. The vertical extent covers the authored band and the whole
+     * envelope, so a bridge deck above the hull and a pit below it are both
+     * inside the region.
+     */
+    fun window(windowCenter: Vec3, envelope: TerrainEnvelope, terrain: CompiledTerrain): AABB {
+        // A rotation-independent disk bound avoids rebuilding on every turn while
+        // still containing every yawed wheel and run.
+        val limit = terrain.windowRadiusBlocks.toDouble()
+        val radius = radius(envelope, terrain)
+        val halfBelow = halfBelow(envelope, terrain)
+        val halfAbove = maxOf(terrain.verticalAboveBlocks.toDouble(), envelope.maxY + 1.0) + COVER_HEIGHT
         require(radius <= limit) {
-            "running gear exceeds terrain WindowRadius=$limit (required=$radius, x=$radialX, z=$radialZ)"
+            "running gear and ramp look-ahead exceed terrain WindowRadius=$limit (required=$radius)"
         }
-        val snappedCenterX = snapCenter(center.x)
-        val snappedCenterZ = snapCenter(center.z)
-        val snappedCenterY = snapCenter(center.y)
+        val center = snap(windowCenter)
         return AABB(
-            snappedCenterX - radius, snappedCenterY - halfBelow, snappedCenterZ - radius,
-            snappedCenterX + radius, snappedCenterY + halfAbove, snappedCenterZ + radius,
+            center.x - radius, center.y - halfBelow, center.z - radius,
+            center.x + radius, center.y + halfAbove, center.z + radius,
         )
     }
+
+    private fun halfBelow(envelope: TerrainEnvelope, terrain: CompiledTerrain): Double =
+        maxOf(terrain.verticalBelowBlocks.toDouble(), -envelope.minY + 1.0) + COVER_HEIGHT
+
+    /** The window centre that [window] was built around; inverse of [window]. */
+    fun centerOf(window: AABB, envelope: TerrainEnvelope, terrain: CompiledTerrain): Vec3 = Vec3(
+        (window.minX + window.maxX) * 0.5,
+        window.minY + halfBelow(envelope, terrain),
+        (window.minZ + window.maxZ) * 0.5,
+    )
 
     /** True when [a] and [b] cover the same snapped window. */
     fun sameWindow(a: AABB, b: AABB): Boolean =
@@ -97,7 +151,6 @@ object TrackedTerrainSampler {
         requestId: Long,
         runtimeGeneration: Long,
         rampGate: RampGate? = null,
-        gear: List<GearProbe> = emptyList(),
     ): TrackedTerrainSampleResult {
         val bounds = snapshot.bounds
         val region = TerrainBox(
@@ -163,21 +216,6 @@ object TrackedTerrainSampler {
         // Heading is part of the geometry. A plan built for a different nose
         // must not be reused just because the boxes did not move.
         hash = hash * 31 + (rampGate?.headingBucket ?: -1).toLong()
-        // Occupancy is part of the installed geometry. A later plan of the same
-        // boxes must not be treated as identical if it refused a ramp the
-        // previous plan still contained. The sampler only runs when the window,
-        // heading or terrain revision already changed, so this does not rebuild
-        // on every wheel bounce.
-        hash = hash * 31 + gear.size.toLong()
-        for (probe in gear.sortedWith(compareBy({ coarse(it.x) }, { coarse(it.z) }, { coarse(it.y) }))) {
-            hash = hash * 31 + coarse(probe.x)
-            hash = hash * 31 + coarse(probe.y)
-            hash = hash * 31 + coarse(probe.z)
-            hash = hash * 31 + coarse(probe.halfX)
-            hash = hash * 31 + coarse(probe.halfY)
-            hash = hash * 31 + coarse(probe.halfZ)
-        }
-
         val plan = TrackedTerrainMeshPlanner.build(
             boxes = boxes,
             terrain = terrain,
@@ -191,7 +229,6 @@ object TrackedTerrainSampler {
             runtimeGeneration = runtimeGeneration,
             terrainRevision = snapshot.revision,
             rampGate = rampGate,
-            gear = gear,
         )
         return TrackedTerrainSampleResult.Ready(plan)
     }
@@ -207,9 +244,6 @@ object TrackedTerrainSampler {
         floor(value / WINDOW_GRID_BLOCKS + 0.5) * WINDOW_GRID_BLOCKS
 
     private fun quantized(value: Double): Long = (value * 10_000.0).roundToLong()
-
-    /** 0.25 m buckets, so suspension bounce does not force a mesh swap. */
-    private fun coarse(value: Double): Long = (value * 4.0).roundToLong()
 
     /** Kept for callers that only need the raw box list of a region. */
     fun boxesOf(snapshot: TerrainRegionSnapshot, bounds: AABB): List<TerrainBox> {

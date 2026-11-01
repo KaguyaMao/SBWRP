@@ -455,7 +455,9 @@ class TrackedRunGeometryTest {
             }
             val rest = spec.renders[side]?.let { it.restPitchM * it.visibleCount }
             assertNotNull(rest, "$side rest length")
-            assertEquals(solved.length, rest!!, 1e-6, "$side rest length is the fixed envelope")
+            // With a physical belt the visible belt is that belt; otherwise the envelope.
+            val expected = compiled.envelope?.restLengthM ?: compiled.chain?.restLengthM ?: solved.length
+            assertEquals(expected, rest!!, 1e-6, "$side rest length is the visible belt's rest length")
         }
     }
 

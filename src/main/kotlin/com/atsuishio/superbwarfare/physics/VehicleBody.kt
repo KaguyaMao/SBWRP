@@ -321,7 +321,7 @@ internal class VehicleBody(
             val support = normal.x * chassisUp.x + normal.y * chassisUp.y + normal.z * chassisUp.z
             if (support > 0.45 || (groundVehicle && abs(normal.y) > .45f)) bodyGrounded = true
             if (support > 0.45f && event.snapshot.normalImpulse.isFinite()) {
-                currentContactSupport += event.snapshot.normalImpulse * PhysicsLevel.TPS.toFloat()
+                currentContactSupport += event.snapshot.normalImpulse / physics.stepSeconds
             }
             if (!clientSide && event.snapshot.normalImpulse > mass * 0.05)
                 impacts.add(VehicleImpact(event.other.owner, event.snapshot))
@@ -764,6 +764,16 @@ internal class VehicleBody(
             listOf(CollisionPart(half, settings.centerOfMassOffset.scale(-1.0)))
         }
         runtime.setDebugCollisionParts(hullParts)
+        // The body origin in the vehicle data frame: the client maps chassis-local
+        // debug edges through getVehicleTransform(partialTick) * (origin + local).
+        runtime.setDebugFrame(spec.localCenter.add(0.0, spec.pivot, 0.0)) {
+            buildList {
+                val turretSpec = spec.turret
+                val barrelSpec = spec.barrel
+                turretBody?.let { if (turretSpec != null) add(it to turretSpec.parts) }
+                barrelBody?.let { if (barrelSpec != null) add(it to barrelSpec.parts) }
+            }
+        }
         runtime.create().whenComplete { _, error ->
             if (disposed) return@whenComplete
             if (error != null) {
@@ -1117,7 +1127,7 @@ internal class VehicleBody(
                 if (spin.isFinite() && kotlin.math.abs(spin) > 1.0e-3f) {
                     val torque = settings.wheelRollingResistance * wheel.suspension.force * radius
                     val inertia = .5f * wheel.body.mass * radius * radius
-                    val impulse = (torque / PhysicsLevel.TPS.toFloat())
+                    val impulse = (torque * physics.stepSeconds)
                         .coerceAtMost(kotlin.math.abs(spin) * inertia)
                     axle.multLocal(-kotlin.math.sign(spin) * impulse)
                     wheel.body.applyTorqueImpulse(axle)
@@ -1131,7 +1141,7 @@ internal class VehicleBody(
         wheels.forEach { wheel ->
             val localAngular = wheel.body.getAngularVelocityLocal(null)
             if (localAngular.x.isFinite()) {
-                wheel.spin = (wheel.spin + localAngular.x / PhysicsLevel.TPS.toFloat())
+                wheel.spin = (wheel.spin + localAngular.x * physics.stepSeconds)
                     .let { ((it + Math.PI.toFloat()) % (Math.PI.toFloat() * 2f) + Math.PI.toFloat() * 2f) % (Math.PI.toFloat() * 2f) - Math.PI.toFloat() }
             }
         }

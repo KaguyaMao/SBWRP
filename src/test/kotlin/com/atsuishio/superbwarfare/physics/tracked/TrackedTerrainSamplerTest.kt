@@ -27,15 +27,36 @@ class TrackedTerrainSamplerTest {
         assertTrue(error.message.orEmpty().contains("WindowRadius"))
     }
 
+    /**
+     * While [TrackedTerrainSampler.covers] holds, the installed window still
+     * contains the whole running gear plus the ramp look-ahead in every yaw.
+     */
     @Test
-    fun snappedWindowContainsTheWholeRunningGearAcrossItsSnapCell() {
-        val envelope = TerrainEnvelope(-3.1, 3.1, -1.2, 1.2, -5.0, 5.0)
-        val terrain = CompiledTerrain(false, 1.0, 1.0, 10, 3, 8)
+    fun aCoveringWindowContainsTheGearAndTheRampLookahead() {
+        val envelope = TerrainEnvelope(-2.2, 2.2, -1.2, 1.2, -4.3, 4.3)
+        val terrain = CompiledTerrain(true, 1.0, 3.0, 12, 3, 4)
         val window = TrackedTerrainSampler.window(Vec3.ZERO, envelope, terrain)
-        for (x in listOf(-0.49, 0.49)) for (z in listOf(-0.49, 0.49)) {
-            assertTrue(window.minX <= x - 3.1 && window.maxX >= x + 3.1)
-            assertTrue(window.minZ <= z - 5.0 && window.maxZ >= z + 5.0)
-            assertTrue(window.minY <= envelope.minY - 0.49 && window.maxY >= envelope.maxY + 0.49)
+        val reach = kotlin.math.hypot(2.2, 4.3 + 3.0 + TrackedTerrainSampler.RAMP_LOOKAHEAD)
+        val limit = TrackedTerrainSampler.COVER_DISTANCE
+        for (step in 0 until 16) {
+            val angle = step * Math.PI / 8.0
+            val center = Vec3(kotlin.math.cos(angle) * limit, 0.0, kotlin.math.sin(angle) * limit)
+            assertTrue(TrackedTerrainSampler.covers(Vec3.ZERO, center))
+            assertTrue(window.minX <= center.x - reach && window.maxX >= center.x + reach)
+            assertTrue(window.minZ <= center.z - reach && window.maxZ >= center.z + reach)
         }
+        assertTrue(window.minY <= envelope.minY - TrackedTerrainSampler.COVER_HEIGHT)
+    }
+
+    /** The window moves only after a real displacement, and never freezes before coverage ends. */
+    @Test
+    fun rebuildIsRequestedBeforeCoverageEnds() {
+        val origin = Vec3.ZERO
+        assertTrue(!TrackedTerrainSampler.wantsRebuild(origin, Vec3(1.5, 0.3, 0.5)))
+        assertTrue(TrackedTerrainSampler.wantsRebuild(origin, Vec3(2.1, 0.0, 0.0)))
+        assertTrue(TrackedTerrainSampler.covers(origin, Vec3(2.1, 0.0, 0.0)))
+        assertTrue(!TrackedTerrainSampler.covers(origin, Vec3(3.1, 0.0, 0.0)))
+        assertTrue(TrackedTerrainSampler.REBUILD_DISTANCE < TrackedTerrainSampler.COVER_DISTANCE)
+        assertTrue(TrackedTerrainSampler.REBUILD_HEIGHT < TrackedTerrainSampler.COVER_HEIGHT)
     }
 }

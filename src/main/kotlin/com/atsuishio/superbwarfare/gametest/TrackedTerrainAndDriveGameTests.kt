@@ -118,12 +118,19 @@ object TrackedTerrainAndDriveGameTests {
      * deliberately excluded from terrain so the belt must produce the motion;
      * the runtime itself still uses the local Bullet terrain mesh.
      */
-    private fun movingHull(helper: GameTestHelper, label: String): MovingHull {
+    private fun movingHull(
+        helper: GameTestHelper,
+        label: String,
+        originZ: Double = 8.0,
+        allowSleep: Boolean = false,
+    ): MovingHull {
         val physics = SparkPhysics.get(helper.getLevel())
-        floor(helper, 5, 10)
+        // Keep the full fitted belt on the real AABB floor without crossing the
+        // neighbouring GameTest structure boundary.
+        floor(helper, 10, 10)
         val spec = compile()
         val anchor = helper.absolutePos(BlockPos.ZERO)
-        val origin = Vector3f(anchor.x + 0.5f, anchor.y + 3.0f, anchor.z + 8.0f)
+        val origin = Vector3f(anchor.x + 0.5f, anchor.y + 3.0f, anchor.z + originZ.toFloat())
         val host = host(physics)
         val chassis = PhysicsRigidBody(
             BoxCollisionShape(0.9f, 0.4f, 1.6f),
@@ -133,12 +140,14 @@ object TrackedTerrainAndDriveGameTests {
         val created = TrackedVehicleRuntime(physics, host, spec, chassis)
         created.contactDriveEnabled = true
         runtime.set(created)
+        chassis.onPrePhysicsTick { runtime.get()?.step() }
         val startZ = java.util.concurrent.atomic.AtomicReference(origin.z.toDouble())
         val setup = physics.submitTask("$label setup") {
             chassis.owner = host
             chassis.collisionGroup = CollisionGroups.CHASSIS
             chassis.setCollideWithGroups(CollisionGroups.NONE)
-            chassis.setSleepingThresholds(0f, 0f)
+            val sleepThreshold = if (allowSleep) 0.05f else 0f
+            chassis.setSleepingThresholds(sleepThreshold, sleepThreshold)
             chassis.setPhysicsLocation(origin)
             physics.addBody(chassis)
             startZ.set(origin.z.toDouble())
@@ -201,7 +210,8 @@ object TrackedTerrainAndDriveGameTests {
                 val y = chassis.getPhysicsLocation(null).y.toDouble()
                 helper.assertTrue(
                     y < startY.get() - 0.05,
-                    "the vehicle must settle onto the terrain, started ${startY.get()} ended $y",
+                    "the vehicle must settle onto the terrain, started ${startY.get()} ended $y; " +
+                        "${runtime.get()?.terrainDiagnostics()?.replace(Regex("terrainCache=\\{[^}]*\\}|stepMetrics=\\S+"), "")}",
                 )
                 helper.assertTrue(
                     y > startY.get() - 2.5,
@@ -418,7 +428,7 @@ object TrackedTerrainAndDriveGameTests {
         floor(helper, 5, 10)
         val spec = compile()
         val anchor = helper.absolutePos(BlockPos.ZERO)
-        val origin = Vector3f(anchor.x + 0.5f, anchor.y + 3.0f, anchor.z + 8.0f)
+        val origin = Vector3f(anchor.x + 0.5f, anchor.y + 3.0f, anchor.z + 0.5f)
         val host = host(physics)
         val chassis = PhysicsRigidBody(
             BoxCollisionShape(0.9f, 0.4f, 1.6f),
@@ -583,12 +593,77 @@ object TrackedTerrainAndDriveGameTests {
             .thenSucceed()
     }
 
+    /**
+     * A parked 99A with no driver must not walk. The measurement starts 20 s after
+     * assembly, once the suspension has settled and the vehicle has had time to fall
+     * asleep (the physics level's sleep deadline is 3 s), and covers 30 s; the
+     * reference is 5 mm (not frozen). Awake, the belt's ground friction walks it a
+     * few mm/s, so sleeping is part of what is being tested.
+     */
+    @JvmStatic
+    @GameTest(template = "empty", batch = "solo-parked-creep", timeoutTicks = 2000)
+    fun aParkedVehicleDoesNotCreep(helper: GameTestHelper) {
+        val (physics, chassis, runtime, _, setup) = movingHull(
+            helper,
+            "s4 parked",
+            originZ = 0.5,
+            allowSleep = true,
+        )
+        val startZ = java.util.concurrent.atomic.AtomicReference(0.0)
+        val peak = java.util.concurrent.atomic.AtomicReference(0.0)
+        helper.startSequence()
+            .thenWaitUntil {
+                helper.assertTrue(setup.isDone, "parked setup did not run")
+                setup.join().let { }
+            }
+            .thenExecute { runtime.get()?.create() }
+            .thenWaitUntil { helper.assertTrue(runtime.get()?.isCreated == true, "the runtime must assemble") }
+            .thenWaitUntil { helper.assertTrue(runtime.get()?.terrainReady() == true, "the terrain mesh must be ready") }
+            .thenIdle(400)
+            .thenExecute {
+                startZ.set(chassis.getPhysicsLocation(null).z.toDouble())
+                peak.set(0.0)
+            }
+            .thenExecuteFor(600) {
+                val moved = chassis.getPhysicsLocation(null).z - startZ.get()
+                if (kotlin.math.abs(moved) > kotlin.math.abs(peak.get())) peak.set(moved)
+            }
+            .thenExecute {
+                val moved = chassis.getPhysicsLocation(null).z - startZ.get()
+                helper.assertTrue(
+                    kotlin.math.abs(peak.get()) <= 0.005,
+                    "a parked vehicle crept ${"%.1f".format(moved * 1000)} mm in 30 s (peak ${"%.1f".format(peak.get() * 1000)} mm), " +
+                        "active=${chassis.isActive} belt=${runtime.get()?.beltBottomPieces()} gaps=${runtime.get()?.beltWorstPinGaps()} " +
+                        "seg=${runtime.get()?.beltSegmentation()} v=${chassis.getLinearVelocity(null)} " +
+                        "contacts=${TrackedSide.entries.associateWith { runtime.get()?.lastSideContact(it) }}",
+                )
+            }
+            .thenExecute { runtime.get()?.closeAsync() }
+            .thenWaitUntil { helper.assertTrue(runtime.get()?.isClosed == true, "the runtime must close") }
+            .thenExecute { physics.submitTask("s4 parked cleanup") { physics.removeBody(chassis) } }
+            .thenWaitUntil { helper.assertTrue(!chassis.isInWorld, "cleanup must remove the chassis") }
+            .thenSucceed()
+    }
+
     /** A right steer must decrease extracted physics yaw. Entity yaw is the negation, so this is a right turn. */
     @JvmStatic
     @GameTest(template = "empty", batch = "solo-right-steer", timeoutTicks = 900)
     fun steeringYawsTheHull(helper: GameTestHelper) {
-        val (physics, chassis, runtime, _, setup) = movingHull(helper, "s4 yaw")
+        val (physics, chassis, runtime, _, setup) = movingHull(helper, "s4 yaw", originZ = 0.5)
         val startYaw = java.util.concurrent.atomic.AtomicReference(0.0)
+        val turned = java.util.concurrent.atomic.AtomicReference(0.0)
+        val measuringYaw = java.util.concurrent.atomic.AtomicBoolean(false)
+        val baseline = java.util.concurrent.atomic.AtomicReference<java.util.concurrent.CompletableFuture<*>?>(null)
+        chassis.onPostPhysicsTick {
+            if (measuringYaw.get()) {
+                val now = yawOf(chassis.getPhysicsRotation(null))
+                var step = now - startYaw.get()
+                while (step > Math.PI) step -= 2.0 * Math.PI
+                while (step < -Math.PI) step += 2.0 * Math.PI
+                turned.getAndUpdate { it + step }
+                startYaw.set(now)
+            }
+        }
         helper.startSequence()
             .thenWaitUntil {
                 helper.assertTrue(setup.isDone, "yaw setup did not run")
@@ -596,19 +671,36 @@ object TrackedTerrainAndDriveGameTests {
             }
             .thenExecute { runtime.get()?.create() }
             .thenWaitUntil { helper.assertTrue(runtime.get()?.isCreated == true, "the runtime must assemble") }
-            .thenIdle(30)
+            // Let the high-mass running gear settle on the local mesh before
+            // measuring commanded yaw; the spawn drop is not steering response.
+            .thenIdle(400)
             .thenExecute {
-                startYaw.set(yawOf(chassis.getPhysicsRotation(null)))
-                runtime.get()?.setDriveCommand(
-                    TrackedVehicleRuntime.DriveCommand(throttle = 0.4f, steer = 1f, powered = true),
-                )
+                baseline.set(physics.submitTask("s4 right steer baseline") {
+                    chassis.setLinearVelocity(Vector3f())
+                    chassis.setAngularVelocity(Vector3f())
+                    runtime.get()?.resetNow()
+                    startYaw.set(yawOf(chassis.getPhysicsRotation(null)))
+                    turned.set(0.0)
+                    runtime.get()?.setDriveCommand(
+                        TrackedVehicleRuntime.DriveCommand(throttle = 0.4f, steer = 1f, powered = true),
+                    )
+                    measuringYaw.set(true)
+                })
+            }
+            .thenWaitUntil {
+                helper.assertTrue(baseline.get()?.isDone == true, "right-steer baseline did not run")
+                baseline.get()?.join()
             }
             .thenIdle(100)
             .thenExecute {
-                val delta = yawOf(chassis.getPhysicsRotation(null)) - startYaw.get()
+                measuringYaw.set(false)
+                val delta = turned.get()
                 helper.assertTrue(
                     delta < -0.1,
-                    "a right steer must decrease extracted physics yaw, delta=$delta rad",
+                    "a right steer must decrease extracted physics yaw, delta=$delta rad " +
+                        "demand=${runtime.get()?.lastDemand()} contacts=${TrackedSide.entries.associateWith { runtime.get()?.lastSideContact(it) }} " +
+                        "support=${runtime.get()?.lastSupportContacts()} velocity=${chassis.getLinearVelocity(null)} " +
+                        "angular=${chassis.getAngularVelocity(null)}",
                 )
             }
             .thenExecute { runtime.get()?.closeAsync() }
@@ -911,7 +1003,14 @@ object TrackedTerrainAndDriveGameTests {
                     created.terrainRampCount() > 0,
                     "the one-block rise must produce a Bullet ramp: ${created.terrainDiagnostics()}",
                 )
+            }
+            // The hull spawns 3 m above the floor and is held until the mesh is
+            // installed. Measure the climb from its resting height, not from the
+            // spawn height, or a perfect climb could never reach the rise.
+            .thenIdle(100)
+            .thenExecute {
                 startY.set(sampledY.get())
+                peakY.set(sampledY.get())
                 drive.set(true)
             }
             .thenWaitUntil {
@@ -1246,6 +1345,28 @@ object TrackedTerrainAndDriveGameTests {
         val chassis = PhysicsRigidBody(BoxCollisionShape(0.9f, 0.4f, 1.6f), spec.sprungAssemblyMassKg.toFloat())
         val runtime = java.util.concurrent.atomic.AtomicReference<TrackedVehicleRuntime?>(null)
         val startZ = java.util.concurrent.atomic.AtomicReference(origin.z.toDouble())
+        val measuring = java.util.concurrent.atomic.AtomicBoolean(false)
+        val observations = java.util.concurrent.ConcurrentLinkedQueue<LongDriveObservation>()
+        chassis.onPostPhysicsTick {
+            if (!measuring.get()) return@onPostPhysicsTick
+            val createdRuntime = runtime.get() ?: return@onPostPhysicsTick
+            val travel = createdRuntime.drainTelemetry()
+                .filter { it.tick >= 0L }
+                .map { it.travelM.toDouble() }
+            val rotation = chassis.getPhysicsRotation(null)
+            val pitch = kotlin.math.atan2(
+                2.0 * (rotation.w * rotation.x + rotation.y * rotation.z),
+                1.0 - 2.0 * (rotation.x * rotation.x + rotation.y * rotation.y),
+            )
+            observations += LongDriveObservation(
+                pitchRad = pitch,
+                travelsM = travel,
+                pieces = createdRuntime.beltBottomPieces().values.sum(),
+                topology = createdRuntime.beltTopology().values.joinToString(";"),
+                repartitions = createdRuntime.beltRepartitionCounts().values.joinToString(";"),
+                segmentation = createdRuntime.beltSegmentation().values.joinToString(";"),
+            )
+        }
         val setup = physics.submitTask("s4 long setup") {
             chassis.setPhysicsLocation(origin)
             chassis.collisionGroup = CollisionGroups.CHASSIS
@@ -1267,10 +1388,12 @@ object TrackedTerrainAndDriveGameTests {
             .thenWaitUntil { helper.assertTrue(runtime.get()?.isCreated == true, "the runtime must assemble") }
             .thenIdle(20)
             .thenExecute {
+                measuring.set(true)
                 runtime.get()?.setDriveCommand(TrackedVehicleRuntime.DriveCommand(throttle = 0.6f, powered = true))
             }
             .thenIdle(600)
             .thenExecute {
+                measuring.set(false)
                 val location = chassis.getPhysicsLocation(null)
                 val velocity = chassis.getLinearVelocity(null)
                 helper.assertTrue(
@@ -1288,6 +1411,37 @@ object TrackedTerrainAndDriveGameTests {
                 helper.assertTrue(location.y > origin.y - 5.0, "the hull fell through the floor, y=${location.y} start=${origin.y}")
                 helper.assertTrue(location.z > startZ.get() + 0.5, "partial throttle must still make progress, z=${location.z}")
                 helper.assertTrue((runtime.get()?.contactMotionCount() ?: 0) > 0, "the long drive must keep writing contact targets")
+                val captured = observations.toList()
+                val travels = captured.flatMap { it.travelsM }
+                val pieces = captured.map { it.pieces }
+                val pitch = captured.map { it.pitchRad }
+                val topology = captured.map { it.topology }.distinct()
+                val repartitions = captured.map { it.repartitions }.distinct()
+                helper.assertTrue(captured.size > 100, "flat-drive telemetry was not sampled often enough: ${captured.size}")
+                helper.assertTrue(
+                    pieces.distinct().size == 1 && (pieces.firstOrNull() ?: 0) == 2,
+                    "straight flat drive changed envelope bottom piece count: ${pieces.distinct()} topology=${topology.take(6)}",
+                )
+                helper.assertTrue(
+                    topology.size == 1 && repartitions.size == 1 && repartitions.singleOrNull() ==
+                        "splits=0 moves=0 merges=0;splits=0 moves=0 merges=0",
+                    "flat drive repartitioned or moved belt material: topologies=${topology.take(6)} counts=${repartitions.take(6)}",
+                )
+                helper.assertTrue(
+                    travels.size > 100 && travels.all { it.isFinite() },
+                    "flat-drive suspension telemetry is missing or non-finite: samples=${travels.size}",
+                )
+                val travelSpan = (travels.maxOrNull() ?: 0.0) - (travels.minOrNull() ?: 0.0)
+                helper.assertTrue(pitch.isNotEmpty() && pitch.all { it.isFinite() }, "flat-drive pitch samples must be finite")
+                Mod.LOGGER.info(
+                    "Flat-drive stability observation: pitchMinDeg={} pitchMaxDeg={} travelMinMm={} travelMaxMm={} topology={} repartitions={}",
+                    Math.toDegrees(pitch.minOrNull() ?: 0.0),
+                    Math.toDegrees(pitch.maxOrNull() ?: 0.0),
+                    (travels.minOrNull() ?: 0.0) * 1000.0,
+                    (travels.maxOrNull() ?: 0.0) * 1000.0,
+                    topology.singleOrNull(),
+                    repartitions.singleOrNull(),
+                )
             }
             .thenExecute { runtime.get()?.closeAsync() }
             .thenWaitUntil { helper.assertTrue(runtime.get()?.isClosed == true, "the runtime must close") }
@@ -1295,6 +1449,128 @@ object TrackedTerrainAndDriveGameTests {
             .thenWaitUntil { helper.assertTrue(!chassis.isInWorld, "cleanup must remove the chassis") }
             .thenSucceed()
     }
+
+    private data class LongDriveObservation(
+        val pitchRad: Double,
+        val travelsM: List<Double>,
+        val pieces: Int,
+        val topology: String,
+        val repartitions: String,
+        val segmentation: String,
+    )
+
+    /** A steady straight drive over a flat floor must not alter the belt partition. */
+    @JvmStatic
+    @GameTest(template = "empty", batch = "solo-flat-drive-stability", timeoutTicks = 1200)
+    fun flatDriveKeepsSuspensionAndBeltTopologyStable(helper: GameTestHelper) {
+        val (physics, chassis, runtime, _, setup) = movingHull(helper, "flat drive stability", originZ = 0.5)
+        val measuring = java.util.concurrent.atomic.AtomicBoolean(false)
+        val observations = java.util.concurrent.ConcurrentLinkedQueue<FlatDriveObservation>()
+        val topologyEvents = java.util.concurrent.ConcurrentLinkedQueue<String>()
+        val lastPieceCount = java.util.concurrent.atomic.AtomicInteger(2)
+        chassis.onPostPhysicsTick {
+            if (!measuring.get()) return@onPostPhysicsTick
+            val created = runtime.get() ?: return@onPostPhysicsTick
+            val rotation = chassis.getPhysicsRotation(null)
+            val pitch = kotlin.math.atan2(
+                2.0 * (rotation.w * rotation.x + rotation.y * rotation.z),
+                1.0 - 2.0 * (rotation.x * rotation.x + rotation.y * rotation.y),
+            )
+            val tick = created.physicsTickCount
+            val travel = created.suspensionTravelSnapshot().values.flatten()
+                .map { Triple(it.first, tick, it.second) }
+            val pieces = created.beltBottomPieces().values.sum()
+            if (pieces != lastPieceCount.getAndSet(pieces)) {
+                topologyEvents += "z=${"%.3f".format(chassis.getPhysicsLocation(null).z)} " +
+                    "v=${"%.3f".format(chassis.getLinearVelocity(null).z)} pitchDeg=${"%.2f".format(Math.toDegrees(pitch))} " +
+                    "pieces=$pieces topology=${created.beltTopology().values.joinToString(";")} " +
+                    "counts=${created.beltRepartitionCounts().values.joinToString(";")} " +
+                    "seg=${created.beltSegmentation().values.joinToString(";")}"
+            }
+            observations += FlatDriveObservation(
+                pitchRad = pitch,
+                travelsM = travel,
+                pieces = pieces,
+                topology = created.beltTopology().values.joinToString(";"),
+                repartitions = created.beltRepartitionCounts().values.joinToString(";"),
+                segmentation = created.beltSegmentation().values.joinToString(";"),
+            )
+        }
+
+        helper.startSequence()
+            .thenWaitUntil {
+                helper.assertTrue(setup.isDone, "flat-drive setup did not run")
+                setup.join().let { }
+            }
+            .thenExecute { runtime.get()?.create() }
+            .thenWaitUntil { helper.assertTrue(runtime.get()?.isCreated == true, "the runtime must assemble") }
+            .thenIdle(400)
+            .thenExecute {
+                runtime.get()?.setDriveCommand(TrackedVehicleRuntime.DriveCommand(throttle = 0.05f, powered = true))
+            }
+            .thenIdle(100)
+            .thenExecute { measuring.set(true) }
+            .thenIdle(100)
+            .thenExecute {
+                measuring.set(false)
+                val captured = observations.toList()
+                val travels = captured.flatMap { it.travelsM }
+                val wheelTravelRanges = travels.groupBy({ it.first }, { it.third }).mapValues { (_, values) ->
+                    (values.minOrNull() ?: 0.0) to (values.maxOrNull() ?: 0.0)
+                }
+                val firstTick = travels.minOfOrNull { it.second } ?: 0L
+                val wheelTravelBySecond = travels.groupBy({ it.first to ((it.second - firstTick) / 20L) }, { it.third })
+                    .mapValues { (_, values) -> values.average() * 1000.0 }
+                    .toSortedMap(compareBy<Pair<Int, Long>> { it.first }.thenBy { it.second })
+                val topologies = captured.map { it.topology }.distinct()
+                val repartitions = captured.map { it.repartitions }.distinct()
+                val pieces = captured.map { it.pieces }.distinct()
+                val pitch = captured.map { it.pitchRad }
+                val travelMin = travels.minOfOrNull { it.third } ?: 0.0
+                val travelMax = travels.maxOfOrNull { it.third } ?: 0.0
+                val diagnostic = "pieces=$pieces topology=${topologies.take(6)} repartitions=${repartitions.take(6)} " +
+                    "segmentation=${captured.lastOrNull()?.segmentation} " +
+                    "topologyEvents=${topologyEvents.take(12)} " +
+                    "pitchDeg=${pitch.minOrNull()?.let(Math::toDegrees)}..${pitch.maxOrNull()?.let(Math::toDegrees)} " +
+                    "travelMm=${travelMin * 1000.0}..${travelMax * 1000.0}"
+                helper.assertTrue(captured.isNotEmpty(), "flat-drive stability sampling produced no frames")
+                helper.assertTrue(pieces == listOf(2), "flat drive changed the two belt bottoms: $diagnostic")
+                helper.assertTrue(topologies.size == 1, "flat drive rebuilt belt topology: $diagnostic")
+                helper.assertTrue(
+                    repartitions.size == 1 && repartitions.single() == "splits=0 moves=0 merges=0;splits=0 moves=0 merges=0",
+                    "flat drive changed belt segmentation: $diagnostic",
+                )
+                helper.assertTrue(travels.isNotEmpty() && travels.all { it.third.isFinite() }, "suspension travel samples missing or non-finite")
+                helper.assertTrue(pitch.isNotEmpty() && pitch.all { it.isFinite() }, "hull pitch samples missing or non-finite")
+                Mod.LOGGER.info(
+                    "Flat-drive stability: pitchMinDeg={} pitchMaxDeg={} travelMinMm={} travelMaxMm={} topology={}",
+                    Math.toDegrees(pitch.minOrNull() ?: 0.0),
+                    Math.toDegrees(pitch.maxOrNull() ?: 0.0),
+                    travelMin * 1000.0,
+                    travelMax * 1000.0,
+                    topologies.singleOrNull(),
+                )
+                Mod.LOGGER.info(
+                    "Flat-drive wheel travel ranges mm={}",
+                    wheelTravelRanges.mapValues { (_, range) -> "${range.first * 1000.0}..${range.second * 1000.0}" },
+                )
+                Mod.LOGGER.info("Flat-drive wheel travel by second mm={}", wheelTravelBySecond)
+            }
+            .thenExecute { runtime.get()?.closeAsync() }
+            .thenWaitUntil { helper.assertTrue(runtime.get()?.isClosed == true, "runtime must close") }
+            .thenExecute { physics.submitTask("flat-drive cleanup") { physics.removeBody(chassis) } }
+            .thenWaitUntil { helper.assertTrue(!chassis.isInWorld, "cleanup must remove chassis") }
+            .thenSucceed()
+    }
+
+    private data class FlatDriveObservation(
+        val pitchRad: Double,
+        val travelsM: List<Triple<Int, Long, Double>>,
+        val pieces: Int,
+        val topology: String,
+        val repartitions: String,
+        val segmentation: String,
+    )
 
     /**
      * Only the left belt has a pad. The chassis is kinematic so roll cannot move
@@ -1566,8 +1842,21 @@ object TrackedTerrainAndDriveGameTests {
     @JvmStatic
     @GameTest(template = "empty", batch = "solo-left-steer", timeoutTicks = 900)
     fun aLeftSteerYawsTheOtherWay(helper: GameTestHelper) {
-        val (physics, chassis, runtime, _, setup) = movingHull(helper, "s4 yaw left")
+        val (physics, chassis, runtime, _, setup) = movingHull(helper, "s4 yaw left", originZ = 0.5)
         val startYaw = java.util.concurrent.atomic.AtomicReference(0.0)
+        val turned = java.util.concurrent.atomic.AtomicReference(0.0)
+        val measuringYaw = java.util.concurrent.atomic.AtomicBoolean(false)
+        val baseline = java.util.concurrent.atomic.AtomicReference<java.util.concurrent.CompletableFuture<*>?>(null)
+        chassis.onPostPhysicsTick {
+            if (measuringYaw.get()) {
+                val now = yawOf(chassis.getPhysicsRotation(null))
+                var step = now - startYaw.get()
+                while (step > Math.PI) step -= 2.0 * Math.PI
+                while (step < -Math.PI) step += 2.0 * Math.PI
+                turned.getAndUpdate { it + step }
+                startYaw.set(now)
+            }
+        }
         helper.startSequence()
             .thenWaitUntil {
                 helper.assertTrue(setup.isDone, "left-yaw setup did not run")
@@ -1575,17 +1864,37 @@ object TrackedTerrainAndDriveGameTests {
             }
             .thenExecute { runtime.get()?.create() }
             .thenWaitUntil { helper.assertTrue(runtime.get()?.isCreated == true, "the runtime must assemble") }
-            .thenIdle(30)
+            // Match the right-turn setup: do not include initial suspension
+            // settling in the steering window.
+            .thenIdle(400)
             .thenExecute {
-                startYaw.set(yawOf(chassis.getPhysicsRotation(null)))
-                runtime.get()?.setDriveCommand(
-                    TrackedVehicleRuntime.DriveCommand(throttle = 0.4f, steer = -1f, powered = true),
-                )
+                baseline.set(physics.submitTask("s4 left steer baseline") {
+                    chassis.setLinearVelocity(Vector3f())
+                    chassis.setAngularVelocity(Vector3f())
+                    runtime.get()?.resetNow()
+                    startYaw.set(yawOf(chassis.getPhysicsRotation(null)))
+                    turned.set(0.0)
+                    runtime.get()?.setDriveCommand(
+                        TrackedVehicleRuntime.DriveCommand(throttle = 0.4f, steer = -1f, powered = true),
+                    )
+                    measuringYaw.set(true)
+                })
+            }
+            .thenWaitUntil {
+                helper.assertTrue(baseline.get()?.isDone == true, "left-steer baseline did not run")
+                baseline.get()?.join()
             }
             .thenIdle(100)
             .thenExecute {
-                val delta = yawOf(chassis.getPhysicsRotation(null)) - startYaw.get()
-                helper.assertTrue(delta > 0.1, "a left steer must increase extracted physics yaw, delta=$delta rad")
+                measuringYaw.set(false)
+                val delta = turned.get()
+                helper.assertTrue(
+                    delta > 0.1,
+                    "a left steer must increase extracted physics yaw, delta=$delta rad " +
+                    "demand=${runtime.get()?.lastDemand()} contacts=${TrackedSide.entries.associateWith { runtime.get()?.lastSideContact(it) }} " +
+                        "support=${runtime.get()?.lastSupportContacts()} velocity=${chassis.getLinearVelocity(null)} " +
+                        "angular=${chassis.getAngularVelocity(null)}",
+                )
             }
             .thenExecute { runtime.get()?.closeAsync() }
             .thenWaitUntil { helper.assertTrue(runtime.get()?.isClosed == true, "the runtime must close") }

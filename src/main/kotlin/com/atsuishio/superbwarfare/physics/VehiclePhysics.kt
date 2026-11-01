@@ -319,7 +319,17 @@ object VehiclePhysics {
         val bodyWorldCenter = state.position.add(0.0, pivot, 0.0)
             .add(bodyRotation.rotate(center))
         if (vehicle != null && data != null) vehicle.updateOBB()
-        val collisionParts = resolveCollisionParts(
+        val trackedSpec = if (data?.engineType == EngineType.TRACK) trackedSpecFor(entity) else null
+        // A tracked definition may author physics-only hull boxes that leave the
+        // running gear free. The gameplay OBBs enclose the tracks, and a hull
+        // that encloses its own belt runs fights their joints every substep.
+        val collisionParts = trackedSpec?.hullBoxes?.takeIf { it.isNotEmpty() }?.map { box ->
+            CollisionPart(
+                half = box.halfExtents,
+                center = box.center.subtract(settings.centerOfMassOffset),
+                rotation = box.rotation.toQuaternion(),
+            )
+        } ?: resolveCollisionParts(
             vehicle, data, info, settings, bodyRotation, bodyWorldCenter
         )
         val half = info?.size ?: collisionParts.fold(Vec3.ZERO) { current, part ->
@@ -334,7 +344,6 @@ object VehiclePhysics {
             resolveArticulation(data, (info?.position ?: Vec3.ZERO).add(settings.centerOfMassOffset)) else null to null
         val authoredMass = VehiclePhysicsUnits.massKg(vehicle?.mass ?: 1f)
         val anchored = engine == EngineType.FIXED
-        val trackedSpec = if (data?.engineType == EngineType.TRACK) trackedSpecFor(entity) else null
         val massPlan = if (trackedSpec != null) {
             VehicleMassPlan.tracked(
                 totalMassKg = authoredMass,

@@ -32,7 +32,28 @@ description: Audit, design, test, or integrate independent road-wheel suspension
 
 ## 物理运行段
 
-- 物理履带是**相邻轮对**之间的动态运行段，不是整侧虚拟板，也不是逐鞋销链。
+- 2026-10-31 起拓扑由数据 `Track.Topology` 选择：
+  - `EnvelopeBelt`（99A 生产使用，取代 `AnchorChain`）：`TrackedEnvelopeBeltCompiler` 按 `BeltOrder`
+    以"轮半径 + 半个履带厚"求外公切线包络，负重轮取静载下沉后的位置（`wheelCenters`），锚点只算偏差。
+    `TrackedDynamicBelt`（SBW 自有刚体，经 `BeltWorld` 记入回滚账本）：前斜段、底部、后斜段、顶部回程
+    为刚性段，真实厚度盒 + 两端半径 t/2 横向圆柱销头；相邻段直接销接；前斜段销在导动轮，顶部销在
+    主动轮、在导动轮处沿自身滑动；后斜段在主动轮处沿自身滑动，由 `Envelope.Tension` 内力拉紧
+    （履带不循环，下半圈长度由此适应悬挂，导动轮固定）；负重轮只锁法向。包角是导/主动轮刚体的
+    复合子形状。底部初始一整块，每游戏帧（FRAME_PRE，不在 Bullet 更新内）按本车地形射线剖面
+    在折点拆分、随折点移动、伸直并保持后合并。必须测量销点间隙、轮锁误差、下沉、拆合次数与反复拆合。
+    普通悬挂弹簧/平均阻尼放在轮—车体安装关节内，只有 bump-stop 与不对称阻尼残差显式施力；不允许
+    对履带关节使用 `overrideIterations`，长链需要通过核心的世界级 `solverIterations` 请求，让接触、
+    摩擦和关节使用同一迭代次数。若接触回调写两条摩擦切线/`contactMotion1/2`，Core world 必须启用
+    `SolverMode.Use2Directions`，否则第二摩擦目标无 solver row。道路轮锁应只约束单向法向，纵向自由，
+    并在分段重绑时将两 frame 锚到当前轮心。依据见 `TrackedEnvelopeBeltNativeTest`、
+    `TrackedContactFrictionNativeTest`、`TrackedSuspensionSprings`。
+  - `AnchorChain`（已被取代，仅保留可编译对比）：由 `EnvelopeAnchorBone` 的锚点给出整条闭合履带，底部按
+    `Chain.UnitPitches` 等分为铰接单元（共享销轴，无缝），在锚点处断开为若干核心 TrackRun；
+    锚点销轴固定到所属轮，非端点负重轮只锁法向。底部单元可向带内加厚，接地面不变。
+    该拓扑需要 `Chain.SolverSubsteps ≥ 2`（核心 `solverSubsteps` 申请）和单元惯量放大，
+    依据见 `TrackedBeltChainNativeTest` / `TrackedChainProductionNativeTest`。
+  - `WheelPairRuns`：以下各条描述的相邻轮对运行段，保留为旧拓扑与组件测试。
+- 物理履带是**相邻轮对**之间的动态运行段，不是整侧虚拟板，也不是逐鞋销链（`WheelPairRuns`）。
 - 每个相邻轮对（含 last→first）一个运行段；轮序必须显式声明，不用 Z 排序推断。
   `BeltOrder` 缺失是编译错误，不是回退到纵向排序的提示。
 - 运行段第一端为轮心转动副（锁三平移、只放行轮轴转动）；

@@ -2353,6 +2353,13 @@ open class VehicleEntity(pEntityType: EntityType<*>, pLevel: Level) : Entity(pEn
     }
 
     override fun baseTick() {
+        // Previous-tick rotation must be captured before the physics pose is
+        // applied. Vanilla baseTick copies the *current* rotation into yRotO/xRotO,
+        // which would erase the step begin() just wrote and leave the model
+        // without rotational interpolation.
+        val previousYaw = yRot
+        val previousPitch = xRot
+        this.prevRoll = this.roll
         VehiclePhysics.begin(this)
         // Cache computed vehicle data for this tick.
         // All downstream reads must use this local variable — never call computed() directly
@@ -2445,8 +2452,6 @@ open class VehicleEntity(pEntityType: EntityType<*>, pLevel: Level) : Entity(pEn
         this.wasHeliCrash = this.heliCrash()
         this.wasVehicleSkip = this.vehicleSkip()
 
-        this.prevRoll = this.roll
-
         //        this.wasInCarMusicPlaying = this.inCarMusicPlaying();
         turretYRotO = this.turretYRot
         turretXRotO = this.turretXRot
@@ -2489,6 +2494,11 @@ open class VehicleEntity(pEntityType: EntityType<*>, pLevel: Level) : Entity(pEn
         absoluteSpeedO = absoluteSpeed
 
         super.baseTick()
+        // Restore the pre-physics rotation as the interpolation start, on the
+        // shortest arc so a heading across +-180 degrees does not spin the model.
+        yRotO = yRot + Mth.wrapDegrees(previousYaw - yRot)
+        xRotO = xRot + Mth.wrapDegrees(previousPitch - xRot)
+        prevRoll = roll + Mth.wrapDegrees(prevRoll - roll)
 
         if (laserScale > 0) {
             laserScale = Math.max(laserScale - 0.1f, 0f)

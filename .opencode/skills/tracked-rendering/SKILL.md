@@ -34,7 +34,11 @@ description: Design, implement, test, or diagnose MCSP-style visible track rende
 4. 连接圆弧和切线，形成闭合路径。
 5. 计算总长度和闭合误差。
 6. 路径求解必须是 SBW 纯数学实现，不访问 Bullet 或 Minecraft 世界。
-7. 不读取 native 运行段的逐段 pose 来反推路径。
+7. `EnvelopeBelt`/`AnchorChain` 拓扑下例外（2026-10-31 用户决策）：可见链节沿物理履带中心线排列，
+   中心线由运行时在物理线程从履带刚体和包角算出（共享销点取两端平均），`EnvelopeBelt` 按弧长重采样为
+   固定 96 点，放进不可变渲染快照（`beltY`/`beltZ`），使拆合前后客户端插值不跳；客户端只读快照，
+   仍不访问 native 刚体，也不写回物理。可见链节数按包络静止长度取（99A 79 节）。`WheelPairRuns`
+   仍按轮圆包络求路径。
 
 ## 链节采样
 

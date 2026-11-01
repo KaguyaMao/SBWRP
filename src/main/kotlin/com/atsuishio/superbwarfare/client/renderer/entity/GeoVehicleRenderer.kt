@@ -523,6 +523,17 @@ open class GeoVehicleRenderer<T>(manager: EntityRendererProvider.Context) :
         // A tracked snapshot owns the visible belt. Do not also lift the whole
         // track root, or each plate would inherit a second suspension offset.
         if (trackedGear == null) {
+            // Before the first physics snapshot the compiled definition still
+            // knows which bones are compile-only markers.
+            val trackedId = com.atsuishio.superbwarfare.data.vehicle.VehicleData.getRegistryId(entity.type)
+            if (com.atsuishio.superbwarfare.physics.GroundVehicleAllowlist.modelOf(trackedId) ==
+                com.atsuishio.superbwarfare.physics.GroundVehicleAllowlist.Model.TRACK_RUN
+            ) {
+                val loaded = com.atsuishio.superbwarfare.physics.tracked.TrackedVehicleDefinitions.load(trackedId)
+                if (loaded is com.atsuishio.superbwarfare.physics.tracked.TrackedVehicleDefinitions.Result.Loaded) {
+                    TrackedBeltRenderer.hideMarkers(instance, loaded.spec.renders.values.flatMap { it.hiddenBones })
+                }
+            }
             leftTrackRoot?.let { root ->
                 root.y = root.definition().pivotY() * 16f + leftSuspensionOffset
             }

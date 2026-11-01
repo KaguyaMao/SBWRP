@@ -76,6 +76,13 @@ object TrackedTerrainDebugService {
         lines += "shapes epoch=${runtime.collisionDebugSnapshot()?.epoch ?: 0} " +
             "segments=${runtime.collisionDebugSnapshot()?.segmentCount ?: 0}"
         lines += "support ${runtime.lastSupportContacts()}"
+        val pieces = runtime.beltBottomPieces()
+        if (pieces.isNotEmpty()) {
+            val gaps = runtime.beltWorstPinGaps()
+            lines += "包络履带 " + pieces.entries.joinToString(" ") { (side, count) ->
+                "$side 底部${count}段 最大销点间隙=${"%.1f".format((gaps[side] ?: 0.0) * 1000.0)}mm"
+            }
+        }
         return lines
     }
 

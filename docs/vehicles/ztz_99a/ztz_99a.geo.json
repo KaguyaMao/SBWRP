@@ -7711,7 +7711,7 @@
 					"pivot": [0, 0, -25.58]
 				},
 				{
-					"name": "leadL",
+					"name": "followL",
 					"parent": "WheelL",
 					"pivot": [29.45313, 17.8125, -61.5175],
 					"cubes": [
@@ -7779,7 +7779,7 @@
 				},
 				{
 					"name": "octagon23",
-					"parent": "leadL",
+					"parent": "followL",
 					"pivot": [31.32813, 17.8125, -61.5175],
 					"cubes": [
 						{
@@ -7874,7 +7874,7 @@
 				},
 				{
 					"name": "octagon24",
-					"parent": "leadL",
+					"parent": "followL",
 					"pivot": [29.45313, 17.8125, -61.5175],
 					"cubes": [
 						{
@@ -9604,7 +9604,7 @@
 					]
 				},
 				{
-					"name": "followL",
+					"name": "leadL",
 					"parent": "WheelL",
 					"pivot": [29.45313, 17.8125, 60.9825],
 					"cubes": [
@@ -9670,7 +9670,7 @@
 				},
 				{
 					"name": "octagon7",
-					"parent": "followL",
+					"parent": "leadL",
 					"pivot": [31.32813, 17.8125, 60.9825],
 					"cubes": [
 						{
@@ -9767,7 +9767,7 @@
 				},
 				{
 					"name": "octagon8",
-					"parent": "followL",
+					"parent": "leadL",
 					"pivot": [29.45313, 17.8125, 60.9825],
 					"cubes": [
 						{
@@ -9822,7 +9822,7 @@
 					"pivot": [0, 0, -25.58]
 				},
 				{
-					"name": "leadR",
+					"name": "followR",
 					"parent": "WheelR",
 					"pivot": [-29.45312, 17.8125, -61.5175],
 					"cubes": [
@@ -9888,7 +9888,7 @@
 				},
 				{
 					"name": "octagon18",
-					"parent": "leadR",
+					"parent": "followR",
 					"pivot": [-31.32812, 17.8125, -61.5175],
 					"cubes": [
 						{
@@ -9983,7 +9983,7 @@
 				},
 				{
 					"name": "octagon19",
-					"parent": "leadR",
+					"parent": "followR",
 					"pivot": [-29.45312, 17.8125, -61.5175],
 					"cubes": [
 						{
@@ -11713,7 +11713,7 @@
 					]
 				},
 				{
-					"name": "followR",
+					"name": "leadR",
 					"parent": "WheelR",
 					"pivot": [-29.45312, 17.8125, 60.9825],
 					"cubes": [
@@ -11779,7 +11779,7 @@
 				},
 				{
 					"name": "octagon20",
-					"parent": "followR",
+					"parent": "leadR",
 					"pivot": [-31.32812, 17.8125, 60.9825],
 					"cubes": [
 						{
@@ -11874,7 +11874,7 @@
 				},
 				{
 					"name": "octagon21",
-					"parent": "followR",
+					"parent": "leadR",
 					"pivot": [-29.45312, 17.8125, 60.9825],
 					"cubes": [
 						{

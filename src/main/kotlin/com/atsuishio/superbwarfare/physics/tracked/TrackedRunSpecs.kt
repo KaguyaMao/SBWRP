@@ -70,15 +70,74 @@ object TrackedRunSpecs {
                 ),
                 joints = emptyList(),
                 collisionGroup = cn.solarmoon.spark_core.physics.body.CollisionGroups.TRACK_LINK,
-                // A run may touch its own wheels/chassis and the per-vehicle
-                // local terrain mesh. It must never touch raw block AABB
-                // terrain.
+                // Other vehicles' wheels and hulls are real obstacles. Within the
+                // same vehicle a run touches only the private terrain mesh: its
+                // own wheels are already held by the run-end joints, and a
+                // contact there would carry the same load a second time, while
+                // its own hull is never a support. Raw block AABB terrain is
+                // never in the mask.
                 collideWithGroups = TrackedTerrainCollision.TERRAIN_MESH or
                     cn.solarmoon.spark_core.physics.body.CollisionGroups.WHEEL or
                     cn.solarmoon.spark_core.physics.body.CollisionGroups.CHASSIS,
-                collideWithOwnerGroups = cn.solarmoon.spark_core.physics.body.CollisionGroups.WHEEL or
-                    cn.solarmoon.spark_core.physics.body.CollisionGroups.CHASSIS or
-                    TrackedTerrainCollision.TERRAIN_MESH,
+                collideWithOwnerGroups = TrackedTerrainCollision.TERRAIN_MESH,
+                friction = friction.toFloat(),
+                explicitGravity = null,
+            )
+        }
+    }
+
+    /**
+     * One core `TrackRunSpec` per [CompiledTrackSide.physicalRuns] entry: links,
+     * internal hinges and collision filtering. Joints to wheels are not in the
+     * spec; the runtime creates them from [CompiledPhysicalRun.externals].
+     */
+    fun compilePhysicalRuns(
+        compiled: CompiledTrackSide,
+        vehicleId: String,
+        friction: Double,
+    ): List<TrackRunSpec> {
+        val side = compiled.side
+        require(compiled.physicalRuns.isNotEmpty()) { "$side has no physical belt runs" }
+        return compiled.physicalRuns.map { run ->
+            TrackRunSpec(
+                name = "${vehicleId}_track_${side.name.lowercase()}_${run.label}_${run.index}",
+                links = run.links.mapIndexed { index, link ->
+                    val half = link.halfExtents
+                    require(half.x > 0.0 && half.y > 0.0 && half.z > 0.0) {
+                        "$side physical run ${run.index} link $index has a degenerate extent: $half"
+                    }
+                    require(link.massKg > 0.0) { "$side physical run ${run.index} link $index has no mass" }
+                    TrackRunLinkSpec(
+                        massKg = link.massKg.toFloat(),
+                        shape = TrackRunLinkShape.Box(half),
+                        position = link.center,
+                        rotationX = link.rotation.x,
+                        rotationY = link.rotation.y,
+                        rotationZ = link.rotation.z,
+                        rotationW = link.rotation.w,
+                    )
+                },
+                joints = run.hinges.map { hinge ->
+                    cn.solarmoon.spark_core.physics.track.TrackRunJointSpec(
+                        previousIndex = hinge.previous,
+                        nextIndex = hinge.next,
+                        pivotInPrevious = hinge.pivotInPrevious,
+                        pivotInNext = hinge.pivotInNext,
+                        axis = 0,
+                        halfAngleRad = hinge.halfAngleRad.toFloat(),
+                        frameRotationInPrevious = cn.solarmoon.spark_core.physics.track.TrackRunRotation(
+                            hinge.frameInPrevious.x, hinge.frameInPrevious.y, hinge.frameInPrevious.z, hinge.frameInPrevious.w,
+                        ),
+                        frameRotationInNext = cn.solarmoon.spark_core.physics.track.TrackRunRotation(
+                            hinge.frameInNext.x, hinge.frameInNext.y, hinge.frameInNext.z, hinge.frameInNext.w,
+                        ),
+                    )
+                },
+                collisionGroup = cn.solarmoon.spark_core.physics.body.CollisionGroups.TRACK_LINK,
+                collideWithGroups = TrackedTerrainCollision.TERRAIN_MESH or
+                    cn.solarmoon.spark_core.physics.body.CollisionGroups.WHEEL or
+                    cn.solarmoon.spark_core.physics.body.CollisionGroups.CHASSIS,
+                collideWithOwnerGroups = TrackedTerrainCollision.TERRAIN_MESH,
                 friction = friction.toFloat(),
                 explicitGravity = null,
             )

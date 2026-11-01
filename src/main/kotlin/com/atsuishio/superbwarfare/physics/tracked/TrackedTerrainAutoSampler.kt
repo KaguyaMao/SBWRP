@@ -40,6 +40,9 @@ object TrackedTerrainAutoSampler {
     /** Ticks a level with no tracked vehicles keeps its builder thread alive. */
     private const val BUILDER_IDLE_TICKS = 200L
 
+    /** A mesh build slower than this, queue wait included, is logged with its split, ns. */
+    private const val SLOW_BUILD_NANOS = 250_000_000L
+
     private class LevelQueue {
         var firstCursor = 0
         var refreshCursor = 0
@@ -63,7 +66,6 @@ object TrackedTerrainAutoSampler {
         requestId: Long,
         runtimeGeneration: Long,
         rampGate: RampGate? = null,
-        gear: List<GearProbe> = emptyList(),
         sink: (TrackedTerrainSampleResult) -> Unit,
     ) {
         val executor = builders.computeIfAbsent(level.mcLevel) { key ->
@@ -71,15 +73,31 @@ object TrackedTerrainAutoSampler {
                 Thread(runnable, "SBW-TrackedTerrain-${level.name}").apply { isDaemon = true }
             }
         }
-        val gearCopy = java.util.List.copyOf(gear)
+        val submitted = System.nanoTime()
         try {
             executor.execute {
+                val started = System.nanoTime()
                 val result = try {
                     TrackedTerrainSampler.sample(
-                        snapshot, terrain, requestId, runtimeGeneration, rampGate, gearCopy,
+                        snapshot, terrain, requestId, runtimeGeneration, rampGate,
                     )
                 } catch (error: Throwable) {
                     TrackedTerrainSampleResult.Missing("mesh build failed: ${error.message}")
+                }
+                val finished = System.nanoTime()
+                // Queue wait and compute time are different problems: the first is
+                // contention on the shared per-level builder, the second is planner
+                // cost. A slow build must say which one it was.
+                if (finished - submitted > SLOW_BUILD_NANOS) {
+                    val triangles = (result as? TrackedTerrainSampleResult.Ready)?.plan?.triangleCount ?: -1
+                    com.atsuishio.superbwarfare.Mod.LOGGER.warn(
+                        "[tracked-terrain] slow mesh build #{}: queueWait={} ms compute={} ms triangles={} sections={}",
+                        requestId,
+                        (started - submitted) / 1_000_000,
+                        (finished - started) / 1_000_000,
+                        triangles,
+                        snapshot.sections.size,
+                    )
                 }
                 sink(result)
             }
